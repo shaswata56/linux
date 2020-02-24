@@ -9,23 +9,18 @@
 #include "xfs_format.h"
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
-#include "xfs_bit.h"
 #include "xfs_mount.h"
 #include "xfs_defer.h"
 #include "xfs_da_format.h"
 #include "xfs_da_btree.h"
 #include "xfs_attr_sf.h"
 #include "xfs_inode.h"
-#include "xfs_alloc.h"
 #include "xfs_trans.h"
-#include "xfs_inode_item.h"
 #include "xfs_bmap.h"
-#include "xfs_bmap_util.h"
 #include "xfs_bmap_btree.h"
 #include "xfs_attr.h"
 #include "xfs_attr_leaf.h"
 #include "xfs_attr_remote.h"
-#include "xfs_error.h"
 #include "xfs_quota.h"
 #include "xfs_trans_space.h"
 #include "xfs_trace.h"
@@ -67,6 +62,7 @@ xfs_attr_args_init(
 	struct xfs_da_args	*args,
 	struct xfs_inode	*dp,
 	const unsigned char	*name,
+	size_t			namelen,
 	int			flags)
 {
 
@@ -79,7 +75,7 @@ xfs_attr_args_init(
 	args->dp = dp;
 	args->flags = flags;
 	args->name = name;
-	args->namelen = strlen((const char *)name);
+	args->namelen = namelen;
 	if (args->namelen >= MAXNAMELEN)
 		return -EFAULT;		/* match IRIX behaviour */
 
@@ -102,7 +98,10 @@ xfs_inode_hasattr(
  * Overall external interface routines.
  *========================================================================*/
 
-/* Retrieve an extended attribute and its value.  Must have ilock. */
+/*
+ * Retrieve an extended attribute and its value.  Must have ilock.
+ * Returns 0 on successful retrieval, otherwise an error.
+ */
 int
 xfs_attr_get_ilocked(
 	struct xfs_inode	*ip,
@@ -120,12 +119,29 @@ xfs_attr_get_ilocked(
 		return xfs_attr_node_get(args);
 }
 
-/* Retrieve an extended attribute by name, and its value. */
+/*
+ * Retrieve an extended attribute by name, and its value if requested.
+ *
+ * If ATTR_KERNOVAL is set in @flags, then the caller does not want the value,
+ * just an indication whether the attribute exists and the size of the value if
+ * it exists. The size is returned in @valuelenp,
+ *
+ * If the attribute is found, but exceeds the size limit set by the caller in
+ * @valuelenp, return -ERANGE with the size of the attribute that was found in
+ * @valuelenp.
+ *
+ * If ATTR_ALLOC is set in @flags, allocate the buffer for the value after
+ * existence of the attribute has been determined. On success, return that
+ * buffer to the caller and leave them to free it. On failure, free any
+ * allocated buffer and ensure the buffer pointer returned to the caller is
+ * null.
+ */
 int
 xfs_attr_get(
 	struct xfs_inode	*ip,
 	const unsigned char	*name,
-	unsigned char		*value,
+	size_t			namelen,
+	unsigned char		**value,
 	int			*valuelenp,
 	int			flags)
 {
@@ -133,26 +149,40 @@ xfs_attr_get(
 	uint			lock_mode;
 	int			error;
 
+	ASSERT((flags & (ATTR_ALLOC | ATTR_KERNOVAL)) || *value);
+
 	XFS_STATS_INC(ip->i_mount, xs_attr_get);
 
 	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
 		return -EIO;
 
-	error = xfs_attr_args_init(&args, ip, name, flags);
+	error = xfs_attr_args_init(&args, ip, name, namelen, flags);
 	if (error)
 		return error;
 
-	args.value = value;
-	args.valuelen = *valuelenp;
 	/* Entirely possible to look up a name which doesn't exist */
 	args.op_flags = XFS_DA_OP_OKNOENT;
+	if (flags & ATTR_ALLOC)
+		args.op_flags |= XFS_DA_OP_ALLOCVAL;
+	else
+		args.value = *value;
+	args.valuelen = *valuelenp;
 
 	lock_mode = xfs_ilock_attr_map_shared(ip);
 	error = xfs_attr_get_ilocked(ip, &args);
 	xfs_iunlock(ip, lock_mode);
-
 	*valuelenp = args.valuelen;
-	return error == -EEXIST ? 0 : error;
+
+	/* on error, we have to clean up allocated value buffers */
+	if (error) {
+		if (flags & ATTR_ALLOC) {
+			kmem_free(args.value);
+			*value = NULL;
+		}
+		return error;
+	}
+	*value = args.value;
+	return 0;
 }
 
 /*
@@ -310,6 +340,7 @@ int
 xfs_attr_set(
 	struct xfs_inode	*dp,
 	const unsigned char	*name,
+	size_t			namelen,
 	unsigned char		*value,
 	int			valuelen,
 	int			flags)
@@ -325,7 +356,7 @@ xfs_attr_set(
 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
 		return -EIO;
 
-	error = xfs_attr_args_init(&args, dp, name, flags);
+	error = xfs_attr_args_init(&args, dp, name, namelen, flags);
 	if (error)
 		return error;
 
@@ -414,6 +445,7 @@ int
 xfs_attr_remove(
 	struct xfs_inode	*dp,
 	const unsigned char	*name,
+	size_t			namelen,
 	int			flags)
 {
 	struct xfs_mount	*mp = dp->i_mount;
@@ -425,7 +457,7 @@ xfs_attr_remove(
 	if (XFS_FORCED_SHUTDOWN(dp->i_mount))
 		return -EIO;
 
-	error = xfs_attr_args_init(&args, dp, name, flags);
+	error = xfs_attr_args_init(&args, dp, name, namelen, flags);
 	if (error)
 		return error;
 
@@ -561,7 +593,7 @@ xfs_attr_leaf_addname(
 	 */
 	dp = args->dp;
 	args->blkno = 0;
-	error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno, -1, &bp);
+	error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno, &bp);
 	if (error)
 		return error;
 
@@ -687,7 +719,7 @@ xfs_attr_leaf_addname(
 		 * remove the "old" attr from that block (neat, huh!)
 		 */
 		error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno,
-					   -1, &bp);
+					   &bp);
 		if (error)
 			return error;
 
@@ -741,7 +773,7 @@ xfs_attr_leaf_removename(
 	 */
 	dp = args->dp;
 	args->blkno = 0;
-	error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno, -1, &bp);
+	error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno, &bp);
 	if (error)
 		return error;
 
@@ -773,6 +805,8 @@ xfs_attr_leaf_removename(
  *
  * This leaf block cannot have a "remote" value, we only call this routine
  * if bmap_one_block() says there is only one block (ie: no remote blks).
+ *
+ * Returns 0 on successful retrieval, otherwise an error.
  */
 STATIC int
 xfs_attr_leaf_get(xfs_da_args_t *args)
@@ -783,7 +817,7 @@ xfs_attr_leaf_get(xfs_da_args_t *args)
 	trace_xfs_attr_leaf_get(args);
 
 	args->blkno = 0;
-	error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno, -1, &bp);
+	error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno, &bp);
 	if (error)
 		return error;
 
@@ -794,9 +828,6 @@ xfs_attr_leaf_get(xfs_da_args_t *args)
 	}
 	error = xfs_attr3_leaf_getvalue(bp, args);
 	xfs_trans_brelse(args->trans, bp);
-	if (!error && (args->rmtblkno > 0) && !(args->flags & ATTR_KERNOVAL)) {
-		error = xfs_attr_rmtval_get(args);
-	}
 	return error;
 }
 
@@ -980,7 +1011,7 @@ restart:
 		 * The INCOMPLETE flag means that we will find the "old"
 		 * attr, not the "new" one.
 		 */
-		args->flags |= XFS_ATTR_INCOMPLETE;
+		args->op_flags |= XFS_DA_OP_INCOMPLETE;
 		state = xfs_da_state_alloc();
 		state->args = args;
 		state->mp = mp;
@@ -1146,7 +1177,7 @@ xfs_attr_node_removename(
 		ASSERT(state->path.blk[0].bp);
 		state->path.blk[0].bp = NULL;
 
-		error = xfs_attr3_leaf_read(args->trans, args->dp, 0, -1, &bp);
+		error = xfs_attr3_leaf_read(args->trans, args->dp, 0, &bp);
 		if (error)
 			goto out;
 
@@ -1239,10 +1270,9 @@ xfs_attr_refillstate(xfs_da_state_t *state)
 	ASSERT((path->active >= 0) && (path->active < XFS_DA_NODE_MAXDEPTH));
 	for (blk = path->blk, level = 0; level < path->active; blk++, level++) {
 		if (blk->disk_blkno) {
-			error = xfs_da3_node_read(state->args->trans,
-						state->args->dp,
-						blk->blkno, blk->disk_blkno,
-						&blk->bp, XFS_ATTR_FORK);
+			error = xfs_da3_node_read_mapped(state->args->trans,
+					state->args->dp, blk->disk_blkno,
+					&blk->bp, XFS_ATTR_FORK);
 			if (error)
 				return error;
 		} else {
@@ -1258,10 +1288,9 @@ xfs_attr_refillstate(xfs_da_state_t *state)
 	ASSERT((path->active >= 0) && (path->active < XFS_DA_NODE_MAXDEPTH));
 	for (blk = path->blk, level = 0; level < path->active; blk++, level++) {
 		if (blk->disk_blkno) {
-			error = xfs_da3_node_read(state->args->trans,
-						state->args->dp,
-						blk->blkno, blk->disk_blkno,
-						&blk->bp, XFS_ATTR_FORK);
+			error = xfs_da3_node_read_mapped(state->args->trans,
+					state->args->dp, blk->disk_blkno,
+					&blk->bp, XFS_ATTR_FORK);
 			if (error)
 				return error;
 		} else {
@@ -1273,11 +1302,13 @@ xfs_attr_refillstate(xfs_da_state_t *state)
 }
 
 /*
- * Look up a filename in a node attribute list.
+ * Retrieve the attribute data from a node attribute list.
  *
  * This routine gets called for any attribute fork that has more than one
  * block, ie: both true Btree attr lists and for single-leaf-blocks with
  * "remote" values taking up more blocks.
+ *
+ * Returns 0 on successful retrieval, otherwise an error.
  */
 STATIC int
 xfs_attr_node_get(xfs_da_args_t *args)
@@ -1299,24 +1330,21 @@ xfs_attr_node_get(xfs_da_args_t *args)
 	error = xfs_da3_node_lookup_int(state, &retval);
 	if (error) {
 		retval = error;
-	} else if (retval == -EEXIST) {
-		blk = &state->path.blk[ state->path.active-1 ];
-		ASSERT(blk->bp != NULL);
-		ASSERT(blk->magic == XFS_ATTR_LEAF_MAGIC);
-
-		/*
-		 * Get the value, local or "remote"
-		 */
-		retval = xfs_attr3_leaf_getvalue(blk->bp, args);
-		if (!retval && (args->rmtblkno > 0)
-		    && !(args->flags & ATTR_KERNOVAL)) {
-			retval = xfs_attr_rmtval_get(args);
-		}
+		goto out_release;
 	}
+	if (retval != -EEXIST)
+		goto out_release;
+
+	/*
+	 * Get the value, local or "remote"
+	 */
+	blk = &state->path.blk[state->path.active - 1];
+	retval = xfs_attr3_leaf_getvalue(blk->bp, args);
 
 	/*
 	 * If not in a transaction, we have to release all the buffers.
 	 */
+out_release:
 	for (i = 0; i < state->path.active; i++) {
 		xfs_trans_brelse(args->trans, state->path.blk[i].bp);
 		state->path.blk[i].bp = NULL;

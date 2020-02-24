@@ -7,19 +7,19 @@
  *   Copyright (C) 2015 NextThing Co
  */
 
-#include <drm/drmP.h>
+#include <linux/component.h>
+#include <linux/dma-mapping.h>
+#include <linux/module.h>
+#include <linux/of_device.h>
+#include <linux/of_graph.h>
+#include <linux/reset.h>
+
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_fb_cma_helper.h>
 #include <drm/drm_gem_cma_helper.h>
 #include <drm/drm_plane_helper.h>
 #include <drm/drm_probe_helper.h>
-
-#include <linux/component.h>
-#include <linux/dma-mapping.h>
-#include <linux/of_device.h>
-#include <linux/of_graph.h>
-#include <linux/reset.h>
 
 #include "sun4i_drv.h"
 #include "sun8i_mixer.h"
@@ -286,10 +286,10 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
 			dev_err(drm->dev,
 				"Couldn't initialize overlay plane\n");
 			return ERR_CAST(layer);
-		};
+		}
 
 		planes[i] = &layer->plane;
-	};
+	}
 
 	for (i = 0; i < mixer->cfg->ui_num; i++) {
 		struct sun8i_ui_layer *layer;
@@ -299,10 +299,10 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
 			dev_err(drm->dev, "Couldn't initialize %s plane\n",
 				i ? "overlay" : "primary");
 			return ERR_CAST(layer);
-		};
+		}
 
 		planes[mixer->cfg->vi_num + i] = &layer->plane;
-	};
+	}
 
 	return planes;
 }

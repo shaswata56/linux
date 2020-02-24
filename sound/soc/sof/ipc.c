@@ -15,13 +15,8 @@
 #include <linux/types.h>
 
 #include "sof-priv.h"
+#include "sof-audio.h"
 #include "ops.h"
-
-/*
- * IPC message default size and timeout (ms).
- * TODO: allow platforms to set size and timeout.
- */
-#define IPC_TIMEOUT_MS		300
 
 static void ipc_trace_message(struct snd_sof_dev *sdev, u32 msg_id);
 static void ipc_stream_message(struct snd_sof_dev *sdev, u32 msg_cmd);
@@ -115,7 +110,7 @@ static void ipc_log_header(struct device *dev, u8 *text, u32 cmd)
 		}
 		break;
 	case SOF_IPC_GLB_COMP_MSG:
-		str = "GLB_COMP_MSG: SET_VALUE";
+		str = "GLB_COMP_MSG";
 		switch (type) {
 		case SOF_IPC_COMP_SET_VALUE:
 			str2 = "SET_VALUE"; break;
@@ -175,6 +170,15 @@ static void ipc_log_header(struct device *dev, u8 *text, u32 cmd)
 		break;
 	case SOF_IPC_GLB_TRACE_MSG:
 		str = "GLB_TRACE_MSG"; break;
+	case SOF_IPC_GLB_TEST_MSG:
+		str = "GLB_TEST_MSG";
+		switch (type) {
+		case SOF_IPC_TEST_IPC_FLOOD:
+			str2 = "IPC_FLOOD"; break;
+		default:
+			str2 = "unknown type"; break;
+		}
+		break;
 	default:
 		str = "unknown GLB command"; break;
 	}
@@ -187,7 +191,8 @@ static void ipc_log_header(struct device *dev, u8 *text, u32 cmd)
 #else
 static inline void ipc_log_header(struct device *dev, u8 *text, u32 cmd)
 {
-	dev_dbg(dev, "%s: 0x%x\n", text, cmd);
+	if ((cmd & SOF_GLB_TYPE_MASK) != SOF_IPC_GLB_TRACE_MSG)
+		dev_dbg(dev, "%s: 0x%x\n", text, cmd);
 }
 #endif
 
@@ -201,14 +206,12 @@ static int tx_wait_done(struct snd_sof_ipc *ipc, struct snd_sof_ipc_msg *msg,
 
 	/* wait for DSP IPC completion */
 	ret = wait_event_timeout(msg->waitq, msg->ipc_complete,
-				 msecs_to_jiffies(IPC_TIMEOUT_MS));
+				 msecs_to_jiffies(sdev->ipc_timeout));
 
 	if (ret == 0) {
 		dev_err(sdev->dev, "error: ipc timed out for 0x%x size %d\n",
 			hdr->cmd, hdr->size);
-		snd_sof_dsp_dbg_dump(ipc->sdev, SOF_DBG_REGS | SOF_DBG_MBOX);
-		snd_sof_ipc_dump(ipc->sdev);
-		snd_sof_trace_notify_for_error(ipc->sdev);
+		snd_sof_handle_fw_exception(ipc->sdev);
 		ret = -ETIMEDOUT;
 	} else {
 		/* copy the data returned from DSP */
@@ -308,19 +311,8 @@ EXPORT_SYMBOL(sof_ipc_tx_message);
 int snd_sof_ipc_reply(struct snd_sof_dev *sdev, u32 msg_id)
 {
 	struct snd_sof_ipc_msg *msg = &sdev->ipc->msg;
-	unsigned long flags;
-
-	/*
-	 * Protect against a theoretical race with sof_ipc_tx_message(): if the
-	 * DSP is fast enough to receive an IPC message, reply to it, and the
-	 * host interrupt processing calls this function on a different core
-	 * from the one, where the sending is taking place, the message might
-	 * not yet be marked as expecting a reply.
-	 */
-	spin_lock_irqsave(&sdev->ipc_lock, flags);
 
 	if (msg->ipc_complete) {
-		spin_unlock_irqrestore(&sdev->ipc_lock, flags);
 		dev_err(sdev->dev, "error: no reply expected, received 0x%x",
 			msg_id);
 		return -EINVAL;
@@ -329,8 +321,6 @@ int snd_sof_ipc_reply(struct snd_sof_dev *sdev, u32 msg_id)
 	/* wake up and return the error if we have waiters on this message ? */
 	msg->ipc_complete = true;
 	wake_up(&msg->waitq);
-
-	spin_unlock_irqrestore(&sdev->ipc_lock, flags);
 
 	return 0;
 }
@@ -357,19 +347,12 @@ void snd_sof_ipc_msgs_rx(struct snd_sof_dev *sdev)
 		break;
 	case SOF_IPC_FW_READY:
 		/* check for FW boot completion */
-		if (!sdev->boot_complete) {
+		if (sdev->fw_state == SOF_FW_BOOT_IN_PROGRESS) {
 			err = sof_ops(sdev)->fw_ready(sdev, cmd);
-			if (err < 0) {
-				/*
-				 * this indicates a mismatch in ABI
-				 * between the driver and fw
-				 */
-				dev_err(sdev->dev, "error: ABI mismatch %d\n",
-					err);
-			} else {
-				/* firmware boot completed OK */
-				sdev->boot_complete = true;
-			}
+			if (err < 0)
+				sdev->fw_state = SOF_FW_BOOT_READY_FAILED;
+			else
+				sdev->fw_state = SOF_FW_BOOT_COMPLETE;
 
 			/* wake up firmware loader */
 			wake_up(&sdev->boot_wait);
@@ -423,12 +406,13 @@ static void ipc_trace_message(struct snd_sof_dev *sdev, u32 msg_id)
 
 static void ipc_period_elapsed(struct snd_sof_dev *sdev, u32 msg_id)
 {
+	struct snd_soc_component *scomp = sdev->component;
 	struct snd_sof_pcm_stream *stream;
 	struct sof_ipc_stream_posn posn;
 	struct snd_sof_pcm *spcm;
 	int direction;
 
-	spcm = snd_sof_find_spcm_comp(sdev, msg_id, &direction);
+	spcm = snd_sof_find_spcm_comp(scomp, msg_id, &direction);
 	if (!spcm) {
 		dev_err(sdev->dev,
 			"error: period elapsed for unknown stream, msg_id %d\n",
@@ -452,12 +436,13 @@ static void ipc_period_elapsed(struct snd_sof_dev *sdev, u32 msg_id)
 /* DSP notifies host of an XRUN within FW */
 static void ipc_xrun(struct snd_sof_dev *sdev, u32 msg_id)
 {
+	struct snd_soc_component *scomp = sdev->component;
 	struct snd_sof_pcm_stream *stream;
 	struct sof_ipc_stream_posn posn;
 	struct snd_sof_pcm *spcm;
 	int direction;
 
-	spcm = snd_sof_find_spcm_comp(sdev, msg_id, &direction);
+	spcm = snd_sof_find_spcm_comp(scomp, msg_id, &direction);
 	if (!spcm) {
 		dev_err(sdev->dev, "error: XRUN for unknown stream, msg_id %d\n",
 			msg_id);
@@ -499,10 +484,11 @@ static void ipc_stream_message(struct snd_sof_dev *sdev, u32 msg_cmd)
 }
 
 /* get stream position IPC - use faster MMIO method if available on platform */
-int snd_sof_ipc_stream_posn(struct snd_sof_dev *sdev,
+int snd_sof_ipc_stream_posn(struct snd_soc_component *scomp,
 			    struct snd_sof_pcm *spcm, int direction,
 			    struct sof_ipc_stream_posn *posn)
 {
+	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(scomp);
 	struct sof_ipc_stream stream;
 	int err;
 
@@ -581,8 +567,10 @@ static int sof_set_get_large_ctrl_data(struct snd_sof_dev *sdev,
 	else
 		err = sof_get_ctrl_copy_params(cdata->type, partdata, cdata,
 					       sparams);
-	if (err < 0)
+	if (err < 0) {
+		kfree(partdata);
 		return err;
+	}
 
 	msg_bytes = sparams->msg_bytes;
 	pl_size = sparams->pl_size;
@@ -629,15 +617,15 @@ static int sof_set_get_large_ctrl_data(struct snd_sof_dev *sdev,
 /*
  * IPC get()/set() for kcontrols.
  */
-int snd_sof_ipc_set_get_comp_data(struct snd_sof_ipc *ipc,
-				  struct snd_sof_control *scontrol,
+int snd_sof_ipc_set_get_comp_data(struct snd_sof_control *scontrol,
 				  u32 ipc_cmd,
 				  enum sof_ipc_ctrl_type ctrl_type,
 				  enum sof_ipc_ctrl_cmd ctrl_cmd,
 				  bool send)
 {
+	struct snd_soc_component *scomp = scontrol->scomp;
 	struct sof_ipc_ctrl_data *cdata = scontrol->control_data;
-	struct snd_sof_dev *sdev = ipc->sdev;
+	struct snd_sof_dev *sdev = snd_soc_component_get_drvdata(scomp);
 	struct sof_ipc_fw_ready *ready = &sdev->fw_ready;
 	struct sof_ipc_fw_version *v = &ready->version;
 	struct sof_ipc_ctrl_data_params sparams;
@@ -776,16 +764,19 @@ int snd_sof_ipc_valid(struct snd_sof_dev *sdev)
 		}
 	}
 
-	if (ready->debug.bits.build) {
+	if (ready->flags & SOF_IPC_INFO_BUILD) {
 		dev_info(sdev->dev,
 			 "Firmware debug build %d on %s-%s - options:\n"
 			 " GDB: %s\n"
 			 " lock debug: %s\n"
 			 " lock vdebug: %s\n",
 			 v->build, v->date, v->time,
-			 ready->debug.bits.gdb ? "enabled" : "disabled",
-			 ready->debug.bits.locks ? "enabled" : "disabled",
-			 ready->debug.bits.locks_verbose ? "enabled" : "disabled");
+			 (ready->flags & SOF_IPC_INFO_GDB) ?
+				"enabled" : "disabled",
+			 (ready->flags & SOF_IPC_INFO_LOCKS) ?
+				"enabled" : "disabled",
+			 (ready->flags & SOF_IPC_INFO_LOCKSV) ?
+				"enabled" : "disabled");
 	}
 
 	/* copy the fw_version into debugfs at first boot */
@@ -799,12 +790,6 @@ struct snd_sof_ipc *snd_sof_ipc_init(struct snd_sof_dev *sdev)
 {
 	struct snd_sof_ipc *ipc;
 	struct snd_sof_ipc_msg *msg;
-
-	/* check if mandatory ops required for ipc are defined */
-	if (!sof_ops(sdev)->fw_ready) {
-		dev_err(sdev->dev, "error: ipc mandatory ops not defined\n");
-		return NULL;
-	}
 
 	ipc = devm_kzalloc(sdev->dev, sizeof(*ipc), GFP_KERNEL);
 	if (!ipc)
@@ -837,6 +822,9 @@ EXPORT_SYMBOL(snd_sof_ipc_init);
 void snd_sof_ipc_free(struct snd_sof_dev *sdev)
 {
 	struct snd_sof_ipc *ipc = sdev->ipc;
+
+	if (!ipc)
+		return;
 
 	/* disable sending of ipc's */
 	mutex_lock(&ipc->tx_mutex);

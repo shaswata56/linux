@@ -291,7 +291,6 @@ static s32 atl2_setup_ring_resources(struct atl2_adapter *adapter)
 		&adapter->ring_dma);
 	if (!adapter->ring_vir_addr)
 		return -ENOMEM;
-	memset(adapter->ring_vir_addr, 0, adapter->ring_size);
 
 	/* Init TXD Ring */
 	adapter->txd_dma = adapter->ring_dma ;
@@ -1002,7 +1001,7 @@ static int atl2_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
  * atl2_tx_timeout - Respond to a Tx Hang
  * @netdev: network interface device structure
  */
-static void atl2_tx_timeout(struct net_device *netdev)
+static void atl2_tx_timeout(struct net_device *netdev, unsigned int txqueue)
 {
 	struct atl2_adapter *adapter = netdev_priv(netdev);
 

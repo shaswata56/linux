@@ -1960,7 +1960,7 @@ gss_unwrap_resp_integ(struct rpc_task *task, struct rpc_cred *cred,
 
 	if (xdr_buf_subsegment(rcv_buf, &integ_buf, data_offset, integ_len))
 		goto unwrap_failed;
-	if (xdr_buf_read_netobj(rcv_buf, &mic, mic_offset))
+	if (xdr_buf_read_mic(rcv_buf, &mic, mic_offset))
 		goto unwrap_failed;
 	maj_stat = gss_verify_mic(ctx->gc_gss_ctx, &integ_buf, &mic);
 	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
@@ -2118,7 +2118,6 @@ static const struct rpc_authops authgss_ops = {
 	.hash_cred	= gss_hash_cred,
 	.lookup_cred	= gss_lookup_cred,
 	.crcreate	= gss_create_cred,
-	.list_pseudoflavors = gss_mech_list_pseudoflavors,
 	.info2flavor	= gss_mech_info2flavor,
 	.flavor2info	= gss_mech_flavor2info,
 };

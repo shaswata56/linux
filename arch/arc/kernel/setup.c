@@ -1,9 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2004, 2007-2010, 2011-2012 Synopsys, Inc. (www.synopsys.com)
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 #include <linux/seq_file.h>
@@ -574,10 +571,6 @@ void __init setup_arch(char **cmdline_p)
 	 * But that is unlikely so keeping it as it is
 	 */
 	root_mountflags &= ~MS_RDONLY;
-
-#if defined(CONFIG_VT) && defined(CONFIG_DUMMY_CONSOLE)
-	conswitchp = &dummy_con;
-#endif
 
 	arc_unwind_init();
 }

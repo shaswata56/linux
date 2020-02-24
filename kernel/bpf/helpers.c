@@ -1,13 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2011-2014 PLUMgrid, http://plumgrid.com
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of version 2 of the GNU General Public
- * License as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * General Public License for more details.
  */
 #include <linux/bpf.h>
 #include <linux/rcupdate.h>
@@ -19,6 +11,7 @@
 #include <linux/uidgid.h>
 #include <linux/filter.h>
 #include <linux/ctype.h>
+#include <linux/jiffies.h>
 
 #include "../../lib/kstrtox.h"
 
@@ -320,12 +313,23 @@ void copy_map_value_locked(struct bpf_map *map, void *dst, void *src,
 	preempt_enable();
 }
 
+BPF_CALL_0(bpf_jiffies64)
+{
+	return get_jiffies_64();
+}
+
+const struct bpf_func_proto bpf_jiffies64_proto = {
+	.func		= bpf_jiffies64,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+};
+
 #ifdef CONFIG_CGROUPS
 BPF_CALL_0(bpf_get_current_cgroup_id)
 {
 	struct cgroup *cgrp = task_dfl_cgroup(current);
 
-	return cgrp->kn->id.id;
+	return cgroup_id(cgrp);
 }
 
 const struct bpf_func_proto bpf_get_current_cgroup_id_proto = {

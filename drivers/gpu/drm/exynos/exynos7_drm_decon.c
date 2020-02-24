@@ -6,8 +6,6 @@
  *	Akshu Agarwal <akshua@gmail.com>
  *	Ajay Kumar <ajaykumar.rs@samsung.com>
  */
-#include <drm/drmP.h>
-#include <drm/exynos_drm.h>
 
 #include <linux/clk.h>
 #include <linux/component.h>
@@ -21,10 +19,14 @@
 #include <video/of_display_timing.h>
 #include <video/of_videomode.h>
 
+#include <drm/drm_fourcc.h>
+#include <drm/drm_vblank.h>
+#include <drm/exynos_drm.h>
+
 #include "exynos_drm_crtc.h"
-#include "exynos_drm_plane.h"
 #include "exynos_drm_drv.h"
 #include "exynos_drm_fb.h"
+#include "exynos_drm_plane.h"
 #include "regs-decon7.h"
 
 /*
@@ -524,7 +526,7 @@ static void decon_init(struct decon_context *ctx)
 		writel(VIDCON1_VCLK_HOLD, ctx->regs + VIDCON1(0));
 }
 
-static void decon_enable(struct exynos_drm_crtc *crtc)
+static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
 {
 	struct decon_context *ctx = crtc->ctx;
 
@@ -544,7 +546,7 @@ static void decon_enable(struct exynos_drm_crtc *crtc)
 	ctx->suspended = false;
 }
 
-static void decon_disable(struct exynos_drm_crtc *crtc)
+static void decon_atomic_disable(struct exynos_drm_crtc *crtc)
 {
 	struct decon_context *ctx = crtc->ctx;
 	int i;
@@ -566,8 +568,8 @@ static void decon_disable(struct exynos_drm_crtc *crtc)
 }
 
 static const struct exynos_drm_crtc_ops decon_crtc_ops = {
-	.enable = decon_enable,
-	.disable = decon_disable,
+	.atomic_enable = decon_atomic_enable,
+	.atomic_disable = decon_atomic_disable,
 	.enable_vblank = decon_enable_vblank,
 	.disable_vblank = decon_disable_vblank,
 	.atomic_begin = decon_atomic_begin,
@@ -651,7 +653,7 @@ static void decon_unbind(struct device *dev, struct device *master,
 {
 	struct decon_context *ctx = dev_get_drvdata(dev);
 
-	decon_disable(ctx->crtc);
+	decon_atomic_disable(ctx->crtc);
 
 	if (ctx->encoder)
 		exynos_dpi_remove(ctx->encoder);

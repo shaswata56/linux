@@ -9,29 +9,21 @@
 #include "xfs_format.h"
 #include "xfs_trans_resv.h"
 #include "xfs_mount.h"
-#include "xfs_defer.h"
 #include "xfs_btree.h"
-#include "xfs_bit.h"
 #include "xfs_log_format.h"
 #include "xfs_trans.h"
 #include "xfs_sb.h"
 #include "xfs_inode.h"
-#include "xfs_icache.h"
 #include "xfs_alloc.h"
 #include "xfs_alloc_btree.h"
 #include "xfs_ialloc.h"
 #include "xfs_ialloc_btree.h"
 #include "xfs_rmap.h"
 #include "xfs_rmap_btree.h"
-#include "xfs_refcount.h"
 #include "xfs_refcount_btree.h"
 #include "xfs_extent_busy.h"
 #include "xfs_ag_resv.h"
-#include "xfs_trans_space.h"
 #include "xfs_quota.h"
-#include "xfs_attr.h"
-#include "xfs_reflink.h"
-#include "scrub/xfs_scrub.h"
 #include "scrub/scrub.h"
 #include "scrub/common.h"
 #include "scrub/trace.h"
@@ -349,17 +341,21 @@ xrep_init_btblock(
 	struct xfs_trans		*tp = sc->tp;
 	struct xfs_mount		*mp = sc->mp;
 	struct xfs_buf			*bp;
+	int				error;
 
 	trace_xrep_init_btblock(mp, XFS_FSB_TO_AGNO(mp, fsb),
 			XFS_FSB_TO_AGBNO(mp, fsb), btnum);
 
 	ASSERT(XFS_FSB_TO_AGNO(mp, fsb) == sc->sa.agno);
-	bp = xfs_trans_get_buf(tp, mp->m_ddev_targp, XFS_FSB_TO_DADDR(mp, fsb),
-			XFS_FSB_TO_BB(mp, 1), 0);
+	error = xfs_trans_get_buf(tp, mp->m_ddev_targp,
+			XFS_FSB_TO_DADDR(mp, fsb), XFS_FSB_TO_BB(mp, 1), 0,
+			&bp);
+	if (error)
+		return error;
 	xfs_buf_zero(bp, 0, BBTOB(bp->b_length));
-	xfs_btree_init_block(mp, bp, btnum, 0, 0, sc->sa.agno, 0);
+	xfs_btree_init_block(mp, bp, btnum, 0, 0, sc->sa.agno);
 	xfs_trans_buf_set_type(tp, bp, XFS_BLFT_BTREE_BUF);
-	xfs_trans_log_buf(tp, bp, 0, bp->b_length);
+	xfs_trans_log_buf(tp, bp, 0, BBTOB(bp->b_length) - 1);
 	bp->b_ops = ops;
 	*bpp = bp;
 
@@ -550,8 +546,6 @@ xrep_reap_block(
 		error = xfs_alloc_read_agf(sc->mp, sc->tp, agno, 0, &agf_bp);
 		if (error)
 			return error;
-		if (!agf_bp)
-			return -ENOMEM;
 	} else {
 		agf_bp = sc->sa.agf_bp;
 	}
@@ -672,7 +666,7 @@ xrep_findroot_agfl_walk(
 {
 	xfs_agblock_t		*agbno = priv;
 
-	return (*agbno == bno) ? XFS_BTREE_QUERY_RANGE_ABORT : 0;
+	return (*agbno == bno) ? -ECANCELED : 0;
 }
 
 /* Does this block match the btree information passed in? */
@@ -702,7 +696,7 @@ xrep_findroot_block(
 	if (owner == XFS_RMAP_OWN_AG) {
 		error = xfs_agfl_walk(mp, ri->agf, ri->agfl_bp,
 				xrep_findroot_agfl_walk, &agbno);
-		if (error == XFS_BTREE_QUERY_RANGE_ABORT)
+		if (error == -ECANCELED)
 			return 0;
 		if (error)
 			return error;

@@ -2166,7 +2166,7 @@ static void sw_get_broad_storm(struct ksz_hw *hw, u8 *percent)
 	num = (data & BROADCAST_STORM_RATE_HI);
 	num <<= 8;
 	num |= (data & BROADCAST_STORM_RATE_LO) >> 8;
-	num = (num * 100 + BROADCAST_STORM_VALUE / 2) / BROADCAST_STORM_VALUE;
+	num = DIV_ROUND_CLOSEST(num * 100, BROADCAST_STORM_VALUE);
 	*percent = (u8) num;
 }
 
@@ -4896,7 +4896,7 @@ unlock:
  * triggered to free up resources so that the transmit routine can continue
  * sending out packets.  The hardware is reset to correct the problem.
  */
-static void netdev_tx_timeout(struct net_device *dev)
+static void netdev_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
 	static unsigned long last_reset;
 

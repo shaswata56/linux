@@ -95,7 +95,8 @@ of ftrace. Here is a list of some of the key files:
   current_tracer:
 
 	This is used to set or display the current tracer
-	that is configured.
+	that is configured. Changing the current tracer clears
+	the ring buffer content as well as the "snapshot" buffer.
 
   available_tracers:
 
@@ -125,7 +126,9 @@ of ftrace. Here is a list of some of the key files:
 
 	This file holds the output of the trace in a human
 	readable format (described below). Note, tracing is temporarily
-	disabled while this file is being read (opened).
+	disabled when the file is open for reading. Once all readers
+	are closed, tracing is re-enabled. Opening this file for
+	writing with the O_TRUNC flag clears the ring buffer content.
 
   trace_pipe:
 
@@ -139,8 +142,9 @@ of ftrace. Here is a list of some of the key files:
 	will not be read again with a sequential read. The
 	"trace" file is static, and if the tracer is not
 	adding more data, it will display the same
-	information every time it is read. This file will not
-	disable tracing while being read.
+	information every time it is read. Unlike the
+	"trace" file, opening this file for reading will not
+	temporarily disable tracing.
 
   trace_options:
 
@@ -183,7 +187,8 @@ of ftrace. Here is a list of some of the key files:
 	CPU buffer and not total size of all buffers. The
 	trace buffers are allocated in pages (blocks of memory
 	that the kernel uses for allocation, usually 4 KB in size).
-	If the last page allocated has room for more bytes
+	A few extra pages may be allocated to accommodate buffer management
+	meta-data. If the last page allocated has room for more bytes
 	than requested, the rest of the page will be used,
 	making the actual allocation bigger than requested or shown.
 	( Note, the size may not be a multiple of the page size
@@ -233,7 +238,7 @@ of ftrace. Here is a list of some of the key files:
 	This interface also allows for commands to be used. See the
 	"Filter commands" section for more details.
 
-	As a speed up, since processing strings can't be quite expensive
+	As a speed up, since processing strings can be quite expensive
 	and requires a check of all functions registered to tracing, instead
 	an index can be written into this file. A number (starting with "1")
 	written will instead select the same corresponding at the line position
@@ -380,7 +385,7 @@ of ftrace. Here is a list of some of the key files:
 
 	By default, 128 comms are saved (see "saved_cmdlines" above). To
 	increase or decrease the amount of comms that are cached, echo
-	in a the number of comms to cache, into this file.
+	the number of comms to cache into this file.
 
   saved_tgids:
 
@@ -487,6 +492,9 @@ of ftrace. Here is a list of some of the key files:
 	To set a clock, simply echo the clock name into this file::
 
 	  # echo global > trace_clock
+
+	Setting a clock clears the ring buffer content as well as the
+	"snapshot" buffer.
 
   trace_marker:
 
@@ -2974,7 +2982,9 @@ Note, the proc sysctl ftrace_enable is a big on/off switch for the
 function tracer. By default it is enabled (when function tracing is
 enabled in the kernel). If it is disabled, all function tracing is
 disabled. This includes not only the function tracers for ftrace, but
-also for any other uses (perf, kprobes, stack tracing, profiling, etc).
+also for any other uses (perf, kprobes, stack tracing, profiling, etc). It
+cannot be disabled if there is a callback with FTRACE_OPS_FL_PERMANENT set
+registered.
 
 Please disable this with care.
 
@@ -3153,7 +3163,10 @@ different. The trace is live.
 
 
 Note, reading the trace_pipe file will block until more input is
-added.
+added. This is contrary to the trace file. If any process opened
+the trace file for reading, it will actually disable tracing and
+prevent new entries from being added. The trace_pipe file does
+not have this limitation.
 
 trace entries
 -------------
@@ -3317,7 +3330,7 @@ directories after it is created.
 
 As you can see, the new directory looks similar to the tracing directory
 itself. In fact, it is very similar, except that the buffer and
-events are agnostic from the main director, or from any other
+events are agnostic from the main directory, or from any other
 instances that are created.
 
 The files in the new directory work just like the files with the

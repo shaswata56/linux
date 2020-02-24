@@ -6,26 +6,28 @@
  *	Joonyoung Shim <jy0922.shim@samsung.com>
  *	Inki Dae <inki.dae@samsung.com>
  */
-#include <drm/drmP.h>
 
-#include <linux/kernel.h>
-#include <linux/platform_device.h>
 #include <linux/clk.h>
+#include <linux/component.h>
+#include <linux/kernel.h>
+#include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
-#include <linux/component.h>
-#include <linux/mfd/syscon.h>
 #include <linux/regmap.h>
 
 #include <video/of_display_timing.h>
 #include <video/of_videomode.h>
 #include <video/samsung_fimd.h>
+
+#include <drm/drm_fourcc.h>
+#include <drm/drm_vblank.h>
 #include <drm/exynos_drm.h>
 
+#include "exynos_drm_crtc.h"
 #include "exynos_drm_drv.h"
 #include "exynos_drm_fb.h"
-#include "exynos_drm_crtc.h"
 #include "exynos_drm_plane.h"
 
 /*
@@ -892,7 +894,7 @@ static void fimd_disable_plane(struct exynos_drm_crtc *crtc,
 		fimd_enable_shadow_channel_path(ctx, win, false);
 }
 
-static void fimd_enable(struct exynos_drm_crtc *crtc)
+static void fimd_atomic_enable(struct exynos_drm_crtc *crtc)
 {
 	struct fimd_context *ctx = crtc->ctx;
 
@@ -910,7 +912,7 @@ static void fimd_enable(struct exynos_drm_crtc *crtc)
 	fimd_commit(ctx->crtc);
 }
 
-static void fimd_disable(struct exynos_drm_crtc *crtc)
+static void fimd_atomic_disable(struct exynos_drm_crtc *crtc)
 {
 	struct fimd_context *ctx = crtc->ctx;
 	int i;
@@ -1004,8 +1006,8 @@ static void fimd_dp_clock_enable(struct exynos_drm_clk *clk, bool enable)
 }
 
 static const struct exynos_drm_crtc_ops fimd_crtc_ops = {
-	.enable = fimd_enable,
-	.disable = fimd_disable,
+	.atomic_enable = fimd_atomic_enable,
+	.atomic_disable = fimd_atomic_disable,
 	.enable_vblank = fimd_enable_vblank,
 	.disable_vblank = fimd_disable_vblank,
 	.atomic_begin = fimd_atomic_begin,
@@ -1096,7 +1098,7 @@ static void fimd_unbind(struct device *dev, struct device *master,
 {
 	struct fimd_context *ctx = dev_get_drvdata(dev);
 
-	fimd_disable(ctx->crtc);
+	fimd_atomic_disable(ctx->crtc);
 
 	exynos_drm_unregister_dma(ctx->drm_dev, ctx->dev);
 

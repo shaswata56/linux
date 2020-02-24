@@ -341,6 +341,10 @@ static int gdrst_mmio_write(struct intel_vgpu *vgpu, unsigned int offset,
 			gvt_dbg_mmio("vgpu%d: request VCS2 Reset\n", vgpu->id);
 			engine_mask |= BIT(VCS1);
 		}
+		if (data & GEN9_GRDOM_GUC) {
+			gvt_dbg_mmio("vgpu%d: request GUC Reset\n", vgpu->id);
+			vgpu_vreg_t(vgpu, GUC_STATUS) |= GS_MIA_IN_RESET;
+		}
 		engine_mask &= INTEL_INFO(vgpu->gvt->dev_priv)->engine_mask;
 	}
 
@@ -460,10 +464,13 @@ static int pipeconf_mmio_write(struct intel_vgpu *vgpu, unsigned int offset,
 static i915_reg_t force_nonpriv_white_list[] = {
 	GEN9_CS_DEBUG_MODE1, //_MMIO(0x20ec)
 	GEN9_CTX_PREEMPT_REG,//_MMIO(0x2248)
+	PS_INVOCATION_COUNT,//_MMIO(0x2348)
 	GEN8_CS_CHICKEN1,//_MMIO(0x2580)
 	_MMIO(0x2690),
 	_MMIO(0x2694),
 	_MMIO(0x2698),
+	_MMIO(0x2754),
+	_MMIO(0x28a0),
 	_MMIO(0x4de0),
 	_MMIO(0x4de4),
 	_MMIO(0x4dfc),
@@ -506,7 +513,7 @@ static inline bool in_whitelist(unsigned int reg)
 static int force_nonpriv_write(struct intel_vgpu *vgpu,
 	unsigned int offset, void *p_data, unsigned int bytes)
 {
-	u32 reg_nonpriv = *(u32 *)p_data;
+	u32 reg_nonpriv = (*(u32 *)p_data) & REG_GENMASK(25, 2);
 	int ring_id = intel_gvt_render_mmio_to_ring_id(vgpu->gvt, offset);
 	u32 ring_base;
 	struct drm_i915_private *dev_priv = vgpu->gvt->dev_priv;
@@ -526,7 +533,7 @@ static int force_nonpriv_write(struct intel_vgpu *vgpu,
 			bytes);
 	} else
 		gvt_err("vgpu(%d) Invalid FORCE_NONPRIV write %x at offset %x\n",
-			vgpu->id, reg_nonpriv, offset);
+			vgpu->id, *(u32 *)p_data, offset);
 
 	return 0;
 }
@@ -817,13 +824,16 @@ static int trigger_aux_channel_interrupt(struct intel_vgpu *vgpu,
 	struct drm_i915_private *dev_priv = vgpu->gvt->dev_priv;
 	enum intel_gvt_event_type event;
 
-	if (reg == _DPA_AUX_CH_CTL)
+	if (reg == i915_mmio_reg_offset(DP_AUX_CH_CTL(AUX_CH_A)))
 		event = AUX_CHANNEL_A;
-	else if (reg == _PCH_DPB_AUX_CH_CTL || reg == _DPB_AUX_CH_CTL)
+	else if (reg == _PCH_DPB_AUX_CH_CTL ||
+		 reg == i915_mmio_reg_offset(DP_AUX_CH_CTL(AUX_CH_B)))
 		event = AUX_CHANNEL_B;
-	else if (reg == _PCH_DPC_AUX_CH_CTL || reg == _DPC_AUX_CH_CTL)
+	else if (reg == _PCH_DPC_AUX_CH_CTL ||
+		 reg == i915_mmio_reg_offset(DP_AUX_CH_CTL(AUX_CH_C)))
 		event = AUX_CHANNEL_C;
-	else if (reg == _PCH_DPD_AUX_CH_CTL || reg == _DPD_AUX_CH_CTL)
+	else if (reg == _PCH_DPD_AUX_CH_CTL ||
+		 reg == i915_mmio_reg_offset(DP_AUX_CH_CTL(AUX_CH_D)))
 		event = AUX_CHANNEL_D;
 	else {
 		WARN_ON(true);
@@ -1252,18 +1262,15 @@ static int send_display_ready_uevent(struct intel_vgpu *vgpu, int ready)
 static int pvinfo_mmio_write(struct intel_vgpu *vgpu, unsigned int offset,
 		void *p_data, unsigned int bytes)
 {
-	u32 data;
-	int ret;
-
-	write_vreg(vgpu, offset, p_data, bytes);
-	data = vgpu_vreg(vgpu, offset);
+	u32 data = *(u32 *)p_data;
+	bool invalid_write = false;
 
 	switch (offset) {
 	case _vgtif_reg(display_ready):
 		send_display_ready_uevent(vgpu, data ? 1 : 0);
 		break;
 	case _vgtif_reg(g2v_notify):
-		ret = handle_g2v_notification(vgpu, data);
+		handle_g2v_notification(vgpu, data);
 		break;
 	/* add xhot and yhot to handled list to avoid error log */
 	case _vgtif_reg(cursor_x_hot):
@@ -1280,13 +1287,19 @@ static int pvinfo_mmio_write(struct intel_vgpu *vgpu, unsigned int offset,
 	case _vgtif_reg(execlist_context_descriptor_hi):
 		break;
 	case _vgtif_reg(rsv5[0])..._vgtif_reg(rsv5[3]):
+		invalid_write = true;
 		enter_failsafe_mode(vgpu, GVT_FAILSAFE_INSUFFICIENT_RESOURCE);
 		break;
 	default:
+		invalid_write = true;
 		gvt_vgpu_err("invalid pvinfo write offset %x bytes %x data %x\n",
 				offset, bytes, data);
 		break;
 	}
+
+	if (!invalid_write)
+		write_vreg(vgpu, offset, p_data, bytes);
+
 	return 0;
 }
 
@@ -1627,6 +1640,16 @@ static int edp_psr_imr_iir_write(struct intel_vgpu *vgpu,
 	return 0;
 }
 
+static int guc_status_read(struct intel_vgpu *vgpu,
+			   unsigned int offset, void *p_data,
+			   unsigned int bytes)
+{
+	/* keep MIA_IN_RESET before clearing */
+	read_vreg(vgpu, offset, p_data, bytes);
+	vgpu_vreg(vgpu, offset) &= ~GS_MIA_IN_RESET;
+	return 0;
+}
+
 static int mmio_read_from_hw(struct intel_vgpu *vgpu,
 		unsigned int offset, void *p_data, unsigned int bytes)
 {
@@ -1690,7 +1713,21 @@ static int ring_mode_mmio_write(struct intel_vgpu *vgpu, unsigned int offset,
 	bool enable_execlist;
 	int ret;
 
+	(*(u32 *)p_data) &= ~_MASKED_BIT_ENABLE(1);
+	if (IS_COFFEELAKE(vgpu->gvt->dev_priv))
+		(*(u32 *)p_data) &= ~_MASKED_BIT_ENABLE(2);
 	write_vreg(vgpu, offset, p_data, bytes);
+
+	if (data & _MASKED_BIT_ENABLE(1)) {
+		enter_failsafe_mode(vgpu, GVT_FAILSAFE_UNSUPPORTED_GUEST);
+		return 0;
+	}
+
+	if (IS_COFFEELAKE(vgpu->gvt->dev_priv) &&
+	    data & _MASKED_BIT_ENABLE(2)) {
+		enter_failsafe_mode(vgpu, GVT_FAILSAFE_UNSUPPORTED_GUEST);
+		return 0;
+	}
 
 	/* when PPGTT mode enabled, we will check if guest has called
 	 * pvinfo, if not, we will treat this guest as non-gvtg-aware
@@ -1770,6 +1807,21 @@ static int ring_reset_ctl_write(struct intel_vgpu *vgpu,
 		data &= ~RESET_CTL_READY_TO_RESET;
 
 	vgpu_vreg(vgpu, offset) = data;
+	return 0;
+}
+
+static int csfe_chicken1_mmio_write(struct intel_vgpu *vgpu,
+				    unsigned int offset, void *p_data,
+				    unsigned int bytes)
+{
+	u32 data = *(u32 *)p_data;
+
+	(*(u32 *)p_data) &= ~_MASKED_BIT_ENABLE(0x18);
+	write_vreg(vgpu, offset, p_data, bytes);
+
+	if (data & _MASKED_BIT_ENABLE(0x10) || data & _MASKED_BIT_ENABLE(0x8))
+		enter_failsafe_mode(vgpu, GVT_FAILSAFE_UNSUPPORTED_GUEST);
+
 	return 0;
 }
 
@@ -1893,7 +1945,8 @@ static int init_generic_mmio_info(struct intel_gvt *gvt)
 	MMIO_DFH(_MMIO(0x20dc), D_ALL, F_MODE_MASK | F_CMD_ACCESS, NULL, NULL);
 	MMIO_DFH(_3D_CHICKEN3, D_ALL, F_MODE_MASK | F_CMD_ACCESS, NULL, NULL);
 	MMIO_DFH(_MMIO(0x2088), D_ALL, F_MODE_MASK | F_CMD_ACCESS, NULL, NULL);
-	MMIO_DFH(_MMIO(0x20e4), D_ALL, F_MODE_MASK | F_CMD_ACCESS, NULL, NULL);
+	MMIO_DFH(FF_SLICE_CS_CHICKEN2, D_ALL,
+		 F_MODE_MASK | F_CMD_ACCESS, NULL, NULL);
 	MMIO_DFH(_MMIO(0x2470), D_ALL, F_MODE_MASK | F_CMD_ACCESS, NULL, NULL);
 	MMIO_DFH(GAM_ECOCHK, D_ALL, F_CMD_ACCESS, NULL, NULL);
 	MMIO_DFH(GEN7_COMMON_SLICE_CHICKEN1, D_ALL, F_MODE_MASK | F_CMD_ACCESS,
@@ -2633,10 +2686,12 @@ static int init_generic_mmio_info(struct intel_gvt *gvt)
 
 	MMIO_DH(EDP_PSR_IMR, D_BDW_PLUS, NULL, edp_psr_imr_iir_write);
 	MMIO_DH(EDP_PSR_IIR, D_BDW_PLUS, NULL, edp_psr_imr_iir_write);
+	MMIO_DH(GUC_STATUS, D_ALL, guc_status_read, NULL);
+
 	return 0;
 }
 
-static int init_broadwell_mmio_info(struct intel_gvt *gvt)
+static int init_bdw_mmio_info(struct intel_gvt *gvt)
 {
 	struct drm_i915_private *dev_priv = gvt->dev_priv;
 	int ret;
@@ -2761,7 +2816,7 @@ static int init_broadwell_mmio_info(struct intel_gvt *gvt)
 	MMIO_D(CHICKEN_PIPESL_1(PIPE_C), D_BDW_PLUS);
 
 	MMIO_D(WM_MISC, D_BDW);
-	MMIO_D(_MMIO(BDW_EDP_PSR_BASE), D_BDW);
+	MMIO_D(_MMIO(_SRD_CTL_EDP), D_BDW);
 
 	MMIO_D(_MMIO(0x6671c), D_BDW_PLUS);
 	MMIO_D(_MMIO(0x66c00), D_BDW_PLUS);
@@ -2837,11 +2892,11 @@ static int init_skl_mmio_info(struct intel_gvt *gvt)
 	MMIO_DH(FORCEWAKE_MEDIA_GEN9, D_SKL_PLUS, NULL, mul_force_wake_write);
 	MMIO_DH(FORCEWAKE_ACK_MEDIA_GEN9, D_SKL_PLUS, NULL, NULL);
 
-	MMIO_F(_MMIO(_DPB_AUX_CH_CTL), 6 * 4, 0, 0, 0, D_SKL_PLUS, NULL,
+	MMIO_F(DP_AUX_CH_CTL(AUX_CH_B), 6 * 4, 0, 0, 0, D_SKL_PLUS, NULL,
 						dp_aux_ch_ctl_mmio_write);
-	MMIO_F(_MMIO(_DPC_AUX_CH_CTL), 6 * 4, 0, 0, 0, D_SKL_PLUS, NULL,
+	MMIO_F(DP_AUX_CH_CTL(AUX_CH_C), 6 * 4, 0, 0, 0, D_SKL_PLUS, NULL,
 						dp_aux_ch_ctl_mmio_write);
-	MMIO_F(_MMIO(_DPD_AUX_CH_CTL), 6 * 4, 0, 0, 0, D_SKL_PLUS, NULL,
+	MMIO_F(DP_AUX_CH_CTL(AUX_CH_D), 6 * 4, 0, 0, 0, D_SKL_PLUS, NULL,
 						dp_aux_ch_ctl_mmio_write);
 
 	MMIO_D(HSW_PWR_WELL_CTL1, D_SKL_PLUS);
@@ -2997,7 +3052,7 @@ static int init_skl_mmio_info(struct intel_gvt *gvt)
 	MMIO_D(CSR_HTP_SKL, D_SKL_PLUS);
 	MMIO_D(CSR_LAST_WRITE, D_SKL_PLUS);
 
-	MMIO_D(BDW_SCRATCH1, D_SKL_PLUS);
+	MMIO_DFH(BDW_SCRATCH1, D_SKL_PLUS, F_CMD_ACCESS, NULL, NULL);
 
 	MMIO_D(SKL_DFSM, D_SKL_PLUS);
 	MMIO_D(DISPIO_CR_TX_BMU_CR0, D_SKL_PLUS);
@@ -3010,8 +3065,8 @@ static int init_skl_mmio_info(struct intel_gvt *gvt)
 	MMIO_D(RPM_CONFIG0, D_SKL_PLUS);
 	MMIO_D(_MMIO(0xd08), D_SKL_PLUS);
 	MMIO_D(RC6_LOCATION, D_SKL_PLUS);
-	MMIO_DFH(GEN7_FF_SLICE_CS_CHICKEN1, D_SKL_PLUS, F_MODE_MASK,
-		NULL, NULL);
+	MMIO_DFH(GEN7_FF_SLICE_CS_CHICKEN1, D_SKL_PLUS,
+		 F_MODE_MASK | F_CMD_ACCESS, NULL, NULL);
 	MMIO_DFH(GEN9_CS_DEBUG_MODE1, D_SKL_PLUS, F_MODE_MASK | F_CMD_ACCESS,
 		NULL, NULL);
 
@@ -3030,7 +3085,7 @@ static int init_skl_mmio_info(struct intel_gvt *gvt)
 	MMIO_D(_MMIO(0x46520), D_SKL_PLUS);
 
 	MMIO_D(_MMIO(0xc403c), D_SKL_PLUS);
-	MMIO_D(_MMIO(0xb004), D_SKL_PLUS);
+	MMIO_DFH(GEN8_GARBCNTL, D_SKL_PLUS, F_CMD_ACCESS, NULL, NULL);
 	MMIO_DH(DMA_CTRL, D_SKL_PLUS, NULL, dma_ctrl_write);
 
 	MMIO_D(_MMIO(0x65900), D_SKL_PLUS);
@@ -3059,7 +3114,10 @@ static int init_skl_mmio_info(struct intel_gvt *gvt)
 	MMIO_D(_MMIO(_PLANE_KEYMSK_1(PIPE_C)), D_SKL_PLUS);
 
 	MMIO_D(_MMIO(0x44500), D_SKL_PLUS);
-	MMIO_DFH(GEN9_CSFE_CHICKEN1_RCS, D_SKL_PLUS, F_CMD_ACCESS, NULL, NULL);
+#define CSFE_CHICKEN1_REG(base) _MMIO((base) + 0xD4)
+	MMIO_RING_DFH(CSFE_CHICKEN1_REG, D_SKL_PLUS, F_MODE_MASK | F_CMD_ACCESS,
+		      NULL, csfe_chicken1_mmio_write);
+#undef CSFE_CHICKEN1_REG
 	MMIO_DFH(GEN8_HDC_CHICKEN1, D_SKL_PLUS, F_MODE_MASK | F_CMD_ACCESS,
 		 NULL, NULL);
 	MMIO_DFH(GEN9_WM_CHICKEN3, D_SKL_PLUS, F_MODE_MASK | F_CMD_ACCESS,
@@ -3239,7 +3297,7 @@ static int init_bxt_mmio_info(struct intel_gvt *gvt)
 	MMIO_D(GEN8_PUSHBUS_ENABLE, D_BXT);
 	MMIO_D(GEN8_PUSHBUS_SHIFT, D_BXT);
 	MMIO_D(GEN6_GFXPAUSE, D_BXT);
-	MMIO_D(GEN8_L3SQCREG1, D_BXT);
+	MMIO_DFH(GEN8_L3SQCREG1, D_BXT, F_CMD_ACCESS, NULL, NULL);
 
 	MMIO_DFH(GEN9_CTX_PREEMPT_REG, D_BXT, F_CMD_ACCESS, NULL, NULL);
 
@@ -3322,20 +3380,20 @@ int intel_gvt_setup_mmio_info(struct intel_gvt *gvt)
 		goto err;
 
 	if (IS_BROADWELL(dev_priv)) {
-		ret = init_broadwell_mmio_info(gvt);
+		ret = init_bdw_mmio_info(gvt);
 		if (ret)
 			goto err;
 	} else if (IS_SKYLAKE(dev_priv)
 		|| IS_KABYLAKE(dev_priv)
 		|| IS_COFFEELAKE(dev_priv)) {
-		ret = init_broadwell_mmio_info(gvt);
+		ret = init_bdw_mmio_info(gvt);
 		if (ret)
 			goto err;
 		ret = init_skl_mmio_info(gvt);
 		if (ret)
 			goto err;
 	} else if (IS_BROXTON(dev_priv)) {
-		ret = init_broadwell_mmio_info(gvt);
+		ret = init_bdw_mmio_info(gvt);
 		if (ret)
 			goto err;
 		ret = init_skl_mmio_info(gvt);
@@ -3379,6 +3437,10 @@ int intel_gvt_for_each_tracked_mmio(struct intel_gvt *gvt,
 	}
 
 	for (i = 0; i < gvt->mmio.num_mmio_block; i++, block++) {
+		/* pvinfo data doesn't come from hw mmio */
+		if (i915_mmio_reg_offset(block->offset) == VGT_PVINFO_PAGE)
+			continue;
+
 		for (j = 0; j < block->size; j += 4) {
 			ret = handler(gvt,
 				      i915_mmio_reg_offset(block->offset) + j,

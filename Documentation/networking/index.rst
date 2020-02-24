@@ -13,8 +13,10 @@ Contents:
    can_ucan_protocol
    device_drivers/index
    dsa/index
-   devlink-info-versions
+   devlink/index
+   ethtool-netlink
    ieee802154
+   j1939
    kapi
    z8530book
    msg_zerocopy
@@ -30,8 +32,9 @@ Contents:
    scaling
    tls
    tls-offload
+   nfc
 
-.. only::  subproject
+.. only::  subproject and html
 
    Indices
    =======

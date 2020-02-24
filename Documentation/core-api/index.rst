@@ -25,15 +25,23 @@ Core utilities
    librs
    genalloc
    errseq
+   packing
    printk-formats
    circular-buffers
    generic-radix-tree
    memory-allocation
    mm-api
+   pin_user_pages
    gfp_mask-from-fs-io
    timekeeping
    boot-time-mm
    memory-hotplug
+   protection-keys
+   ../RCU/index
+   gcc-plugins
+   symbol-namespaces
+   padata
+   ioctl
 
 
 Interfaces for kernel debugging
@@ -45,7 +53,7 @@ Interfaces for kernel debugging
    debug-objects
    tracepoint
 
-.. only::  subproject
+.. only:: subproject and html
 
    Indices
    =======

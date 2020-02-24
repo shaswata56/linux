@@ -955,12 +955,12 @@ static const struct v4l2_file_operations imgu_v4l2_fops = {
 static const struct v4l2_ioctl_ops imgu_v4l2_ioctl_ops = {
 	.vidioc_querycap = imgu_vidioc_querycap,
 
-	.vidioc_enum_fmt_vid_cap_mplane = vidioc_enum_fmt_vid_cap,
+	.vidioc_enum_fmt_vid_cap = vidioc_enum_fmt_vid_cap,
 	.vidioc_g_fmt_vid_cap_mplane = imgu_vidioc_g_fmt,
 	.vidioc_s_fmt_vid_cap_mplane = imgu_vidioc_s_fmt,
 	.vidioc_try_fmt_vid_cap_mplane = imgu_vidioc_try_fmt,
 
-	.vidioc_enum_fmt_vid_out_mplane = vidioc_enum_fmt_vid_out,
+	.vidioc_enum_fmt_vid_out = vidioc_enum_fmt_vid_out,
 	.vidioc_g_fmt_vid_out_mplane = imgu_vidioc_g_fmt,
 	.vidioc_s_fmt_vid_out_mplane = imgu_vidioc_s_fmt,
 	.vidioc_try_fmt_vid_out_mplane = imgu_vidioc_try_fmt,
@@ -1260,6 +1260,11 @@ static int imgu_v4l2_node_setup(struct imgu_device *imgu, unsigned int pipe,
 		r = media_create_pad_link(&vdev->entity, 0, &sd->entity,
 					  node_num, flags);
 	} else {
+		if (node->id == IMGU_NODE_OUT) {
+			flags |= MEDIA_LNK_FL_ENABLED | MEDIA_LNK_FL_IMMUTABLE;
+			node->enabled = true;
+		}
+
 		r = media_create_pad_link(&sd->entity, node_num, &vdev->entity,
 					  0, flags);
 	}

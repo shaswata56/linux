@@ -696,7 +696,7 @@ static long pmbus_reg2data_vid(struct pmbus_data *data,
 	long val = sensor->data;
 	long rv = 0;
 
-	switch (data->info->vrm_version) {
+	switch (data->info->vrm_version[sensor->page]) {
 	case vr11:
 		if (val >= 0x02 && val <= 0xb2)
 			rv = DIV_ROUND_CLOSEST(160000 - (val - 2) * 625, 100);
@@ -708,6 +708,14 @@ static long pmbus_reg2data_vid(struct pmbus_data *data,
 	case vr13:
 		if (val >= 0x01)
 			rv = 500 + (val - 1) * 10;
+		break;
+	case imvp9:
+		if (val >= 0x01)
+			rv = 200 + (val - 1) * 10;
+		break;
+	case amd625mv:
+		if (val >= 0x0 && val <= 0xd8)
+			rv = DIV_ROUND_CLOSEST(155000 - val * 625, 100);
 		break;
 	}
 	return rv;
@@ -1088,6 +1096,9 @@ static struct pmbus_sensor *pmbus_add_sensor(struct pmbus_data *data,
 		snprintf(sensor->name, sizeof(sensor->name), "%s%d",
 			 name, seq);
 
+	if (data->flags & PMBUS_WRITE_PROTECTED)
+		readonly = true;
+
 	sensor->page = page;
 	sensor->reg = reg;
 	sensor->class = class;
@@ -1217,7 +1228,8 @@ static int pmbus_add_sensor_attrs_one(struct i2c_client *client,
 				      const struct pmbus_driver_info *info,
 				      const char *name,
 				      int index, int page,
-				      const struct pmbus_sensor_attr *attr)
+				      const struct pmbus_sensor_attr *attr,
+				      bool paged)
 {
 	struct pmbus_sensor *base;
 	bool upper = !!(attr->gbit & 0xff00);	/* need to check STATUS_WORD */
@@ -1225,7 +1237,7 @@ static int pmbus_add_sensor_attrs_one(struct i2c_client *client,
 
 	if (attr->label) {
 		ret = pmbus_add_label(data, name, index, attr->label,
-				      attr->paged ? page + 1 : 0);
+				      paged ? page + 1 : 0);
 		if (ret)
 			return ret;
 	}
@@ -1258,6 +1270,30 @@ static int pmbus_add_sensor_attrs_one(struct i2c_client *client,
 	return 0;
 }
 
+static bool pmbus_sensor_is_paged(const struct pmbus_driver_info *info,
+				  const struct pmbus_sensor_attr *attr)
+{
+	int p;
+
+	if (attr->paged)
+		return true;
+
+	/*
+	 * Some attributes may be present on more than one page despite
+	 * not being marked with the paged attribute. If that is the case,
+	 * then treat the sensor as being paged and add the page suffix to the
+	 * attribute name.
+	 * We don't just add the paged attribute to all such attributes, in
+	 * order to maintain the un-suffixed labels in the case where the
+	 * attribute is only on page 0.
+	 */
+	for (p = 1; p < info->pages; p++) {
+		if (info->func[p] & attr->func)
+			return true;
+	}
+	return false;
+}
+
 static int pmbus_add_sensor_attrs(struct i2c_client *client,
 				  struct pmbus_data *data,
 				  const char *name,
@@ -1271,14 +1307,15 @@ static int pmbus_add_sensor_attrs(struct i2c_client *client,
 	index = 1;
 	for (i = 0; i < nattrs; i++) {
 		int page, pages;
+		bool paged = pmbus_sensor_is_paged(info, attrs);
 
-		pages = attrs->paged ? info->pages : 1;
+		pages = paged ? info->pages : 1;
 		for (page = 0; page < pages; page++) {
 			if (!(info->func[page] & attrs->func))
 				continue;
 			ret = pmbus_add_sensor_attrs_one(client, data, info,
 							 name, index, page,
-							 attrs);
+							 attrs, paged);
 			if (ret)
 				return ret;
 			index++;
@@ -1942,11 +1979,14 @@ static ssize_t pmbus_set_samples(struct device *dev,
 	long val;
 	struct i2c_client *client = to_i2c_client(dev->parent);
 	struct pmbus_samples_reg *reg = to_samples_reg(devattr);
+	struct pmbus_data *data = i2c_get_clientdata(client);
 
 	if (kstrtol(buf, 0, &val) < 0)
 		return -EINVAL;
 
+	mutex_lock(&data->update_lock);
 	ret = _pmbus_write_word_data(client, reg->page, reg->attr->reg, val);
+	mutex_unlock(&data->update_lock);
 
 	return ret ? : count;
 }
@@ -2111,6 +2151,15 @@ static int pmbus_init_common(struct i2c_client *client, struct pmbus_data *data,
 	ret = i2c_smbus_read_byte_data(client, PMBUS_CAPABILITY);
 	if (ret >= 0 && (ret & PB_CAPABILITY_ERROR_CHECK))
 		client->flags |= I2C_CLIENT_PEC;
+
+	/*
+	 * Check if the chip is write protected. If it is, we can not clear
+	 * faults, and we should not try it. Also, in that case, writes into
+	 * limit registers need to be disabled.
+	 */
+	ret = i2c_smbus_read_byte_data(client, PMBUS_WRITE_PROTECT);
+	if (ret > 0 && (ret & PB_WP_ANY))
+		data->flags |= PMBUS_WRITE_PROTECTED | PMBUS_SKIP_STATUS_CHECK;
 
 	if (data->info->pages)
 		pmbus_clear_faults(client);

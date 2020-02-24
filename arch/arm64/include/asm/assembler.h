@@ -1,20 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Based on arch/arm/include/asm/assembler.h, arch/arm/mm/proc-macros.S
  *
  * Copyright (C) 1996-2000 Russell King
  * Copyright (C) 2012 ARM Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #ifndef __ASSEMBLY__
 #error "Only include this from assembly code"
@@ -49,12 +38,6 @@
 
 	.macro	restore_daif, flags:req
 	msr	daif, \flags
-	.endm
-
-	/* Only on aarch64 pstate, PSR_D_BIT is different for aarch32 */
-	.macro	inherit_daif, pstate:req, tmp:req
-	and	\tmp, \pstate, #(PSR_D_BIT | PSR_A_BIT | PSR_I_BIT | PSR_F_BIT)
-	msr	daif, \tmp
 	.endm
 
 	/* IRQ is the lowest priority flag, unconditionally unmask the rest. */
@@ -97,17 +80,14 @@
 	.endm
 
 /*
- * SMP data memory barrier
- */
-	.macro	smp_dmb, opt
-	dmb	\opt
-	.endm
-
-/*
  * RAS Error Synchronization barrier
  */
 	.macro  esb
+#ifdef CONFIG_ARM64_RAS_EXTN
 	hint    #16
+#else
+	nop
+#endif
 	.endm
 
 /*
@@ -128,17 +108,6 @@ alternative_else
 	SB_BARRIER_INSN
 	nop
 alternative_endif
-	.endm
-
-/*
- * Sanitise a 64-bit bounded index wrt speculation, returning zero if out
- * of bounds.
- */
-	.macro	mask_nospec64, idx, limit, tmp
-	sub	\tmp, \idx, \limit
-	bic	\tmp, \tmp, \idx
-	and	\idx, \idx, \tmp, asr #63
-	csdb
 	.endm
 
 /*
@@ -357,6 +326,13 @@ alternative_endif
 	.endm
 
 /*
+ * tcr_set_t1sz - update TCR.T1SZ
+ */
+	.macro	tcr_set_t1sz, valreg, t1sz
+	bfi	\valreg, \t1sz, #TCR_T1SZ_OFFSET, #TCR_TxSZ_WIDTH
+	.endm
+
+/*
  * tcr_compute_pa_size - set TCR.(I)PS to the highest supported
  * ID_AA64MMFR0_EL1.PARange value
  *
@@ -473,17 +449,6 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
 	.endm
 
 /*
- * Annotate a function as position independent, i.e., safe to be called before
- * the kernel virtual mapping is activated.
- */
-#define ENDPIPROC(x)			\
-	.globl	__pi_##x;		\
-	.type 	__pi_##x, %function;	\
-	.set	__pi_##x, x;		\
-	.size	__pi_##x, . - x;	\
-	ENDPROC(x)
-
-/*
  * Annotate a function as being unsuitable for kprobes.
  */
 #ifdef CONFIG_KPROBES
@@ -545,9 +510,13 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
  * In future this may be nop'ed out when dealing with 52-bit kernel VAs.
  * 	ttbr: Value of ttbr to set, modified.
  */
-	.macro	offset_ttbr1, ttbr
-#ifdef CONFIG_ARM64_USER_VA_BITS_52
+	.macro	offset_ttbr1, ttbr, tmp
+#ifdef CONFIG_ARM64_VA_BITS_52
+	mrs_s	\tmp, SYS_ID_AA64MMFR2_EL1
+	and	\tmp, \tmp, #(0xf << ID_AA64MMFR2_LVA_SHIFT)
+	cbnz	\tmp, .Lskipoffs_\@
 	orr	\ttbr, \ttbr, #TTBR1_BADDR_4852_OFFSET
+.Lskipoffs_\@ :
 #endif
 	.endm
 
@@ -557,7 +526,7 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
  * to be nop'ed out when dealing with 52-bit kernel VAs.
  */
 	.macro	restore_ttbr1, ttbr
-#ifdef CONFIG_ARM64_USER_VA_BITS_52
+#ifdef CONFIG_ARM64_VA_BITS_52
 	bic	\ttbr, \ttbr, #TTBR1_BADDR_4852_OFFSET
 #endif
 	.endm
@@ -706,8 +675,8 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
  * where <label> is optional, and marks the point where execution will resume
  * after a yield has been performed. If omitted, execution resumes right after
  * the endif_yield_neon invocation. Note that the entire sequence, including
- * the provided patchup code, will be omitted from the image if CONFIG_PREEMPT
- * is not defined.
+ * the provided patchup code, will be omitted from the image if
+ * CONFIG_PREEMPTION is not defined.
  *
  * As a convenience, in the case where no patchup code is required, the above
  * sequence may be abbreviated to
@@ -735,7 +704,7 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
 	.endm
 
 	.macro		if_will_cond_yield_neon
-#ifdef CONFIG_PREEMPT
+#ifdef CONFIG_PREEMPTION
 	get_current_task	x0
 	ldr		x0, [x0, #TSK_TI_PREEMPT]
 	sub		x0, x0, #PREEMPT_DISABLE_OFFSET

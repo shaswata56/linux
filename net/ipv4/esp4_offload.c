@@ -1,13 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * IPV4 GSO/GRO offload support
  * Linux INET implementation
  *
  * Copyright (C) 2016 secunet Security Networks AG
  * Author: Steffen Klassert <steffen.klassert@secunet.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
  *
  * ESP GRO support
  */
@@ -59,6 +56,8 @@ static struct sk_buff *esp4_gro_receive(struct list_head *head,
 				      spi, IPPROTO_ESP, AF_INET);
 		if (!x)
 			goto out_reset;
+
+		skb->mark = xfrm_smark_get(skb->mark, x);
 
 		sp->xvec[sp->len++] = x;
 		sp->olen++;
@@ -315,9 +314,7 @@ static int __init esp4_offload_init(void)
 
 static void __exit esp4_offload_exit(void)
 {
-	if (xfrm_unregister_type_offload(&esp_type_offload, AF_INET) < 0)
-		pr_info("%s: can't remove xfrm type offload\n", __func__);
-
+	xfrm_unregister_type_offload(&esp_type_offload, AF_INET);
 	inet_del_offload(&esp4_offload, IPPROTO_ESP);
 }
 

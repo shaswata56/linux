@@ -1,18 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2011 Texas Instruments Incorporated - http://www.ti.com/
  * Author: Rob Clark <rob@ti.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <drm/drm_atomic_helper.h>
@@ -240,7 +229,8 @@ static int omap_connector_get_modes(struct drm_connector *connector)
 	 * operation to the panel API.
 	 */
 	if (omap_connector->output->panel)
-		return drm_panel_get_modes(omap_connector->output->panel);
+		return drm_panel_get_modes(omap_connector->output->panel,
+					   connector);
 
 	/*
 	 * We can't retrieve modes, which can happen for instance for a DVI or

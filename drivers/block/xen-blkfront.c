@@ -151,9 +151,6 @@ MODULE_PARM_DESC(max_ring_page_order, "Maximum order of pages to be used for the
 #define BLK_RING_SIZE(info)	\
 	__CONST_RING_SIZE(blkif, XEN_PAGE_SIZE * (info)->nr_ring_pages)
 
-#define BLK_MAX_RING_SIZE	\
-	__CONST_RING_SIZE(blkif, XEN_PAGE_SIZE * XENBUS_MAX_RING_GRANTS)
-
 /*
  * ring-ref%u i=(-1UL) would take 11 characters + 'ring-ref' is 8, so 19
  * characters are enough. Define to 20 to keep consistent with backend.
@@ -177,12 +174,12 @@ struct blkfront_ring_info {
 	unsigned int evtchn, irq;
 	struct work_struct work;
 	struct gnttab_free_callback callback;
-	struct blk_shadow shadow[BLK_MAX_RING_SIZE];
 	struct list_head indirect_pages;
 	struct list_head grants;
 	unsigned int persistent_gnts_c;
 	unsigned long shadow_free;
 	struct blkfront_info *dev_info;
+	struct blk_shadow shadow[];
 };
 
 /*
@@ -1113,8 +1110,8 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 	if (!VDEV_IS_EXTENDED(info->vdevice)) {
 		err = xen_translate_vdev(info->vdevice, &minor, &offset);
 		if (err)
-			return err;		
- 		nr_parts = PARTS_PER_DISK;
+			return err;
+		nr_parts = PARTS_PER_DISK;
 	} else {
 		minor = BLKIF_MINOR_EXT(info->vdevice);
 		nr_parts = PARTS_PER_EXT_DISK;
@@ -1310,11 +1307,11 @@ static void blkif_free_ring(struct blkfront_ring_info *rinfo)
 		}
 
 free_shadow:
-		kfree(rinfo->shadow[i].grants_used);
+		kvfree(rinfo->shadow[i].grants_used);
 		rinfo->shadow[i].grants_used = NULL;
-		kfree(rinfo->shadow[i].indirect_grants);
+		kvfree(rinfo->shadow[i].indirect_grants);
 		rinfo->shadow[i].indirect_grants = NULL;
-		kfree(rinfo->shadow[i].sg);
+		kvfree(rinfo->shadow[i].sg);
 		rinfo->shadow[i].sg = NULL;
 	}
 
@@ -1353,7 +1350,7 @@ static void blkif_free(struct blkfront_info *info, int suspend)
 	for (i = 0; i < info->nr_rings; i++)
 		blkif_free_ring(&info->rinfo[i]);
 
-	kfree(info->rinfo);
+	kvfree(info->rinfo);
 	info->rinfo = NULL;
 	info->nr_rings = 0;
 }
@@ -1914,9 +1911,10 @@ static int negotiate_mq(struct blkfront_info *info)
 	if (!info->nr_rings)
 		info->nr_rings = 1;
 
-	info->rinfo = kcalloc(info->nr_rings,
-			      sizeof(struct blkfront_ring_info),
-			      GFP_KERNEL);
+	info->rinfo = kvcalloc(info->nr_rings,
+			       struct_size(info->rinfo, shadow,
+					   BLK_RING_SIZE(info)),
+			       GFP_KERNEL);
 	if (!info->rinfo) {
 		xenbus_dev_fatal(info->xbdev, -ENOMEM, "allocating ring_info structure");
 		info->nr_rings = 0;
@@ -2232,17 +2230,17 @@ static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo)
 
 	for (i = 0; i < BLK_RING_SIZE(info); i++) {
 		rinfo->shadow[i].grants_used =
-			kcalloc(grants,
-				sizeof(rinfo->shadow[i].grants_used[0]),
-				GFP_NOIO);
-		rinfo->shadow[i].sg = kcalloc(psegs,
-					      sizeof(rinfo->shadow[i].sg[0]),
-					      GFP_NOIO);
+			kvcalloc(grants,
+				 sizeof(rinfo->shadow[i].grants_used[0]),
+				 GFP_NOIO);
+		rinfo->shadow[i].sg = kvcalloc(psegs,
+					       sizeof(rinfo->shadow[i].sg[0]),
+					       GFP_NOIO);
 		if (info->max_indirect_segments)
 			rinfo->shadow[i].indirect_grants =
-				kcalloc(INDIRECT_GREFS(grants),
-					sizeof(rinfo->shadow[i].indirect_grants[0]),
-					GFP_NOIO);
+				kvcalloc(INDIRECT_GREFS(grants),
+					 sizeof(rinfo->shadow[i].indirect_grants[0]),
+					 GFP_NOIO);
 		if ((rinfo->shadow[i].grants_used == NULL) ||
 			(rinfo->shadow[i].sg == NULL) ||
 		     (info->max_indirect_segments &&
@@ -2256,11 +2254,11 @@ static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo)
 
 out_of_memory:
 	for (i = 0; i < BLK_RING_SIZE(info); i++) {
-		kfree(rinfo->shadow[i].grants_used);
+		kvfree(rinfo->shadow[i].grants_used);
 		rinfo->shadow[i].grants_used = NULL;
-		kfree(rinfo->shadow[i].sg);
+		kvfree(rinfo->shadow[i].sg);
 		rinfo->shadow[i].sg = NULL;
-		kfree(rinfo->shadow[i].indirect_grants);
+		kvfree(rinfo->shadow[i].indirect_grants);
 		rinfo->shadow[i].indirect_grants = NULL;
 	}
 	if (!list_empty(&rinfo->indirect_pages)) {
@@ -2632,6 +2630,7 @@ static const struct block_device_operations xlvbd_block_fops =
 	.release = blkif_release,
 	.getgeo = blkif_getgeo,
 	.ioctl = blkif_ioctl,
+	.compat_ioctl = blkdev_compat_ptr_ioctl,
 };
 
 

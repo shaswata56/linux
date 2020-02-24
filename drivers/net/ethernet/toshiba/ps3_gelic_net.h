@@ -301,7 +301,7 @@ struct gelic_card {
 	 */
 	unsigned int irq;
 	struct gelic_descr *tx_top, *rx_top;
-	struct gelic_descr descr[0]; /* must be the last */
+	struct gelic_descr descr[]; /* must be the last */
 };
 
 struct gelic_port {
@@ -359,7 +359,7 @@ int gelic_net_open(struct net_device *netdev);
 int gelic_net_stop(struct net_device *netdev);
 netdev_tx_t gelic_net_xmit(struct sk_buff *skb, struct net_device *netdev);
 void gelic_net_set_multi(struct net_device *netdev);
-void gelic_net_tx_timeout(struct net_device *netdev);
+void gelic_net_tx_timeout(struct net_device *netdev, unsigned int txqueue);
 int gelic_net_setup_netdev(struct net_device *netdev, struct gelic_card *card);
 
 /* shared ethtool ops */

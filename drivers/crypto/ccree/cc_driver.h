@@ -28,7 +28,6 @@
 
 /* Registers definitions from shared/hw/ree_include */
 #include "cc_host_regs.h"
-#define CC_DEV_SHA_MAX 512
 #include "cc_crypto_ctx.h"
 #include "cc_hw_queue_defs.h"
 #include "cc_sram_mgr.h"
@@ -53,6 +52,9 @@ enum cc_std_body {
 
 #define CC_COHERENT_CACHE_PARAMS 0xEEE
 
+#define CC_PINS_FULL	0x0
+#define CC_PINS_SLIM	0x9F
+
 /* Maximum DMA mask supported by IP */
 #define DMA_BIT_MASK_LEN 48
 
@@ -66,6 +68,8 @@ enum cc_std_body {
 #define CC_COMP_IRQ_MASK BIT(CC_HOST_IRR_AXIM_COMP_INT_BIT_SHIFT)
 
 #define CC_SECURITY_DISABLED_MASK BIT(CC_SECURITY_DISABLED_VALUE_BIT_SHIFT)
+
+#define CC_NVM_IS_IDLE_MASK BIT(CC_NVM_IS_IDLE_VALUE_BIT_SHIFT)
 
 #define AXIM_MON_COMP_VALUE GENMASK(CC_AXIM_MON_COMP_VALUE_BIT_SIZE + \
 				    CC_AXIM_MON_COMP_VALUE_BIT_SHIFT, \
@@ -121,15 +125,6 @@ struct cc_cpp_req {
 struct cc_crypto_req {
 	void (*user_cb)(struct device *dev, void *req, int err);
 	void *user_arg;
-	dma_addr_t ivgen_dma_addr[CC_MAX_IVGEN_DMA_ADDRESSES];
-	/* For the first 'ivgen_dma_addr_len' addresses of this array,
-	 * generated IV would be placed in it by send_request().
-	 * Same generated IV for all addresses!
-	 */
-	/* Amount of 'ivgen_dma_addr' elements to be filled. */
-	unsigned int ivgen_dma_addr_len;
-	/* The generated IV size required, 8/16 B allowed. */
-	unsigned int ivgen_size;
 	struct completion seq_compl; /* request completion */
 	struct cc_cpp_req cpp;
 };
@@ -137,13 +132,11 @@ struct cc_crypto_req {
 /**
  * struct cc_drvdata - driver private data context
  * @cc_base:	virt address of the CC registers
- * @irq:	device IRQ number
- * @irq_mask:	Interrupt mask shadow (1 for masked interrupts)
+ * @irq:	bitmap indicating source of last interrupt
  */
 struct cc_drvdata {
 	void __iomem *cc_base;
 	int irq;
-	u32 irq_mask;
 	struct completion hw_queue_avail; /* wait for HW queue availability */
 	struct platform_device *plat_dev;
 	cc_sram_addr_t mlli_sram_addr;
@@ -153,7 +146,6 @@ struct cc_drvdata {
 	void *aead_handle;
 	void *request_mgr_handle;
 	void *fips_handle;
-	void *ivgen_handle;
 	void *sram_mgr_handle;
 	void *debugfs;
 	struct clk *clk;
@@ -166,6 +158,7 @@ struct cc_drvdata {
 	int std_bodies;
 	bool sec_disabled;
 	u32 comp_mask;
+	bool pm_on;
 };
 
 struct cc_crypto_alg {
@@ -216,6 +209,7 @@ static inline void dump_byte_array(const char *name, const u8 *the_array,
 		__dump_byte_array(name, the_array, size);
 }
 
+bool cc_wait_for_reset_completion(struct cc_drvdata *drvdata);
 int init_cc_regs(struct cc_drvdata *drvdata, bool is_probe);
 void fini_cc_regs(struct cc_drvdata *drvdata);
 int cc_clk_on(struct cc_drvdata *drvdata);

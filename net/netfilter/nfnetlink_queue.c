@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * This is a module which is used for queueing packets and communicating with
  * userspace via nfnetlink.
@@ -8,11 +9,6 @@
  * Based on the old ipv4-only ip_queue.c:
  * (C) 2000-2002 James Morris <jmorris@intercode.com.au>
  * (C) 2003-2005 Netfilter Core Team <coreteam@netfilter.org>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -398,7 +394,7 @@ nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
 	char *secdata = NULL;
 	u32 seclen = 0;
 
-	size =    nlmsg_total_size(sizeof(struct nfgenmsg))
+	size = nlmsg_total_size(sizeof(struct nfgenmsg))
 		+ nla_total_size(sizeof(struct nfqnl_msg_packet_hdr))
 		+ nla_total_size(sizeof(u_int32_t))	/* ifindex */
 		+ nla_total_size(sizeof(u_int32_t))	/* ifindex */
@@ -457,7 +453,7 @@ nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
 	}
 
 	if (queue->flags & NFQA_CFG_F_UID_GID) {
-		size +=  (nla_total_size(sizeof(u_int32_t))	/* uid */
+		size += (nla_total_size(sizeof(u_int32_t))	/* uid */
 			+ nla_total_size(sizeof(u_int32_t)));	/* gid */
 	}
 
@@ -782,7 +778,7 @@ nfqnl_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
 {
 	unsigned int queued;
 	struct nfqnl_instance *queue;
-	struct sk_buff *skb, *segs;
+	struct sk_buff *skb, *segs, *nskb;
 	int err = -ENOBUFS;
 	struct net *net = entry->state.net;
 	struct nfnl_queue_net *q = nfnl_queue_pernet(net);
@@ -819,8 +815,7 @@ nfqnl_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
 		goto out_err;
 	queued = 0;
 	err = 0;
-	do {
-		struct sk_buff *nskb = segs->next;
+	skb_list_walk_safe(segs, segs, nskb) {
 		if (err == 0)
 			err = __nfqnl_enqueue_packet_gso(net, queue,
 							segs, entry);
@@ -828,8 +823,7 @@ nfqnl_enqueue_packet(struct nf_queue_entry *entry, unsigned int queuenum)
 			queued++;
 		else
 			kfree_skb(segs);
-		segs = nskb;
-	} while (segs);
+	}
 
 	if (queued) {
 		if (err) /* some segments are already queued */
@@ -863,7 +857,7 @@ nfqnl_mangle(void *data, int data_len, struct nf_queue_entry *e, int diff)
 		}
 		skb_put(e->skb, diff);
 	}
-	if (!skb_make_writable(e->skb, data_len))
+	if (skb_ensure_writable(e->skb, data_len))
 		return -ENOMEM;
 	skb_copy_to_linear_data(e->skb, data, data_len);
 	e->skb->ip_summed = CHECKSUM_NONE;

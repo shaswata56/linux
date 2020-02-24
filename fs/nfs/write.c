@@ -57,6 +57,7 @@ static const struct rpc_call_ops nfs_commit_ops;
 static const struct nfs_pgio_completion_ops nfs_async_write_completion_ops;
 static const struct nfs_commit_completion_ops nfs_commit_completion_ops;
 static const struct nfs_rw_ops nfs_rw_write_ops;
+static void nfs_inode_remove_request(struct nfs_page *req);
 static void nfs_clear_request_commit(struct nfs_page *req);
 static void nfs_init_cinfo_from_inode(struct nfs_commit_info *cinfo,
 				      struct inode *inode);
@@ -103,7 +104,7 @@ EXPORT_SYMBOL_GPL(nfs_commit_free);
 
 static struct nfs_pgio_header *nfs_writehdr_alloc(void)
 {
-	struct nfs_pgio_header *p = mempool_alloc(nfs_wdata_mempool, GFP_NOIO);
+	struct nfs_pgio_header *p = mempool_alloc(nfs_wdata_mempool, GFP_KERNEL);
 
 	memset(p, 0, sizeof(*p));
 	p->rw_mode = FMODE_WRITE;
@@ -242,13 +243,24 @@ out:
 /* A writeback failed: mark the page as bad, and invalidate the page cache */
 static void nfs_set_pageerror(struct address_space *mapping)
 {
+	struct inode *inode = mapping->host;
+
 	nfs_zap_mapping(mapping->host, mapping);
+	/* Force file size revalidation */
+	spin_lock(&inode->i_lock);
+	NFS_I(inode)->cache_validity |= NFS_INO_REVAL_FORCED |
+					NFS_INO_REVAL_PAGECACHE |
+					NFS_INO_INVALID_SIZE;
+	spin_unlock(&inode->i_lock);
 }
 
 static void nfs_mapping_set_error(struct page *page, int error)
 {
+	struct address_space *mapping = page_file_mapping(page);
+
 	SetPageError(page);
-	mapping_set_error(page_file_mapping(page), error);
+	mapping_set_error(mapping, error);
+	nfs_set_pageerror(mapping);
 }
 
 /*
@@ -591,21 +603,11 @@ release_request:
 
 static void nfs_write_error(struct nfs_page *req, int error)
 {
+	trace_nfs_write_error(req, error);
 	nfs_mapping_set_error(req->wb_page, error);
+	nfs_inode_remove_request(req);
 	nfs_end_page_writeback(req);
 	nfs_release_request(req);
-}
-
-static bool
-nfs_error_is_fatal_on_server(int err)
-{
-	switch (err) {
-	case 0:
-	case -ERESTARTSYS:
-	case -EINTR:
-		return false;
-	}
-	return nfs_error_is_fatal(err);
 }
 
 /*
@@ -615,7 +617,6 @@ nfs_error_is_fatal_on_server(int err)
 static int nfs_page_async_flush(struct nfs_pageio_descriptor *pgio,
 				struct page *page)
 {
-	struct address_space *mapping;
 	struct nfs_page *req;
 	int ret = 0;
 
@@ -630,12 +631,11 @@ static int nfs_page_async_flush(struct nfs_pageio_descriptor *pgio,
 	WARN_ON_ONCE(test_bit(PG_CLEAN, &req->wb_flags));
 
 	/* If there is a fatal error that covers this write, just exit */
-	ret = 0;
-	mapping = page_file_mapping(page);
-	if (test_bit(AS_ENOSPC, &mapping->flags) ||
-	    test_bit(AS_EIO, &mapping->flags))
+	ret = pgio->pg_error;
+	if (nfs_error_is_fatal_on_server(ret))
 		goto out_launder;
 
+	ret = 0;
 	if (!nfs_pageio_add_request(pgio, req)) {
 		ret = pgio->pg_error;
 		/*
@@ -647,6 +647,7 @@ static int nfs_page_async_flush(struct nfs_pageio_descriptor *pgio,
 		} else
 			ret = -EAGAIN;
 		nfs_redirty_request(req);
+		pgio->pg_error = 0;
 	} else
 		nfs_add_stats(page_file_mapping(page)->host,
 				NFSIOS_WRITEPAGES, 1);
@@ -666,7 +667,7 @@ static int nfs_do_writepage(struct page *page, struct writeback_control *wbc,
 	ret = nfs_page_async_flush(pgio, page);
 	if (ret == -EAGAIN) {
 		redirty_page_for_writepage(wbc, page);
-		ret = 0;
+		ret = AOP_WRITEPAGE_ACTIVATE;
 	}
 	return ret;
 }
@@ -685,10 +686,11 @@ static int nfs_writepage_locked(struct page *page,
 	nfs_pageio_init_write(&pgio, inode, 0,
 				false, &nfs_async_write_completion_ops);
 	err = nfs_do_writepage(page, wbc, &pgio);
+	pgio.pg_error = 0;
 	nfs_pageio_complete(&pgio);
 	if (err < 0)
 		return err;
-	if (pgio.pg_error < 0)
+	if (nfs_error_is_fatal(pgio.pg_error))
 		return pgio.pg_error;
 	return 0;
 }
@@ -698,7 +700,8 @@ int nfs_writepage(struct page *page, struct writeback_control *wbc)
 	int ret;
 
 	ret = nfs_writepage_locked(page, wbc);
-	unlock_page(page);
+	if (ret != AOP_WRITEPAGE_ACTIVATE)
+		unlock_page(page);
 	return ret;
 }
 
@@ -707,7 +710,8 @@ static int nfs_writepages_callback(struct page *page, struct writeback_control *
 	int ret;
 
 	ret = nfs_do_writepage(page, wbc, data);
-	unlock_page(page);
+	if (ret != AOP_WRITEPAGE_ACTIVATE)
+		unlock_page(page);
 	return ret;
 }
 
@@ -721,12 +725,11 @@ int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 	struct inode *inode = mapping->host;
 	struct nfs_pageio_descriptor pgio;
 	struct nfs_io_completion *ioc;
-	unsigned int pflags = memalloc_nofs_save();
 	int err;
 
 	nfs_inc_stats(inode, NFSIOS_VFSWRITEPAGES);
 
-	ioc = nfs_io_completion_alloc(GFP_NOFS);
+	ioc = nfs_io_completion_alloc(GFP_KERNEL);
 	if (ioc)
 		nfs_io_completion_init(ioc, nfs_io_completion_commit, inode);
 
@@ -734,15 +737,14 @@ int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 				&nfs_async_write_completion_ops);
 	pgio.pg_io_completion = ioc;
 	err = write_cache_pages(mapping, wbc, nfs_writepages_callback, &pgio);
+	pgio.pg_error = 0;
 	nfs_pageio_complete(&pgio);
 	nfs_io_completion_put(ioc);
-
-	memalloc_nofs_restore(pflags);
 
 	if (err < 0)
 		goto out_err;
 	err = pgio.pg_error;
-	if (err < 0)
+	if (nfs_error_is_fatal(err))
 		goto out_err;
 	return 0;
 out_err:
@@ -795,7 +797,6 @@ static void nfs_inode_remove_request(struct nfs_page *req)
 	struct nfs_inode *nfsi = NFS_I(inode);
 	struct nfs_page *head;
 
-	atomic_long_dec(&nfsi->nrequests);
 	if (nfs_page_group_sync_on_bit(req, PG_REMOVE)) {
 		head = req->wb_head;
 
@@ -808,8 +809,10 @@ static void nfs_inode_remove_request(struct nfs_page *req)
 		spin_unlock(&mapping->private_lock);
 	}
 
-	if (test_and_clear_bit(PG_INODE_REF, &req->wb_flags))
+	if (test_and_clear_bit(PG_INODE_REF, &req->wb_flags)) {
 		nfs_release_request(req);
+		atomic_long_dec(&nfsi->nrequests);
+	}
 }
 
 static void
@@ -1006,7 +1009,7 @@ static void nfs_write_completion(struct nfs_pgio_header *hdr)
 		nfs_list_remove_request(req);
 		if (test_bit(NFS_IOHDR_ERROR, &hdr->flags) &&
 		    (hdr->good_bytes < bytes)) {
-			nfs_set_pageerror(page_file_mapping(req->wb_page));
+			trace_nfs_comp_error(req, hdr->error);
 			nfs_mapping_set_error(req->wb_page, hdr->error);
 			goto remove_req;
 		}
@@ -1411,8 +1414,7 @@ static void nfs_initiate_write(struct nfs_pgio_header *hdr,
 
 	task_setup_data->priority = priority;
 	rpc_ops->write_setup(hdr, msg, &task_setup_data->rpc_client);
-	trace_nfs_initiate_write(hdr->inode, hdr->io_start, hdr->good_bytes,
-				 hdr->args.stable);
+	trace_nfs_initiate_write(hdr);
 }
 
 /* If a nfs_flush_* function fails, it should remove reqs from @head and
@@ -1576,8 +1578,7 @@ static int nfs_writeback_done(struct rpc_task *task,
 		return status;
 
 	nfs_add_stats(inode, NFSIOS_SERVERWRITTENBYTES, hdr->res.count);
-	trace_nfs_writeback_done(inode, task->tk_status,
-				 hdr->args.offset, hdr->res.verf);
+	trace_nfs_writeback_done(task, hdr);
 
 	if (hdr->res.verf->committed < hdr->args.stable &&
 	    task->tk_status >= 0) {
@@ -1657,6 +1658,8 @@ static void nfs_writeback_result(struct rpc_task *task,
 			 */
 			argp->stable = NFS_FILE_SYNC;
 		}
+		resp->count = 0;
+		resp->verf->committed = 0;
 		rpc_restart_call_prepare(task);
 	}
 }
@@ -1832,11 +1835,12 @@ static void nfs_commit_done(struct rpc_task *task, void *calldata)
 
 	/* Call the NFS version-specific code */
 	NFS_PROTO(data->inode)->commit_done(task, data);
-	trace_nfs_commit_done(data);
+	trace_nfs_commit_done(task, data);
 }
 
 static void nfs_commit_release_pages(struct nfs_commit_data *data)
 {
+	const struct nfs_writeverf *verf = data->res.verf;
 	struct nfs_page	*req;
 	int status = data->task.tk_status;
 	struct nfs_commit_info cinfo;
@@ -1855,6 +1859,7 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 			(long long)req_offset(req));
 		if (status < 0) {
 			if (req->wb_page) {
+				trace_nfs_commit_error(req, status);
 				nfs_mapping_set_error(req->wb_page, status);
 				nfs_inode_remove_request(req);
 			}
@@ -1864,7 +1869,8 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 
 		/* Okay, COMMIT succeeded, apparently. Check the verifier
 		 * returned by the server against all stored verfs. */
-		if (!nfs_write_verifier_cmp(&req->wb_verf, &data->verf.verifier)) {
+		if (verf->committed > NFS_UNSTABLE &&
+		    !nfs_write_verifier_cmp(&req->wb_verf, &verf->verifier)) {
 			/* We have a match */
 			if (req->wb_page)
 				nfs_inode_remove_request(req);

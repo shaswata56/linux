@@ -15,15 +15,15 @@
  * Hardware interface for generic Intel audio DSP HDA IP
  */
 
-#include <linux/module.h>
 #include <sound/hdaudio_ext.h>
+#include <sound/hda_register.h>
+
+#include <linux/module.h>
+#include <sound/intel-nhlt.h>
 #include <sound/sof.h>
 #include <sound/sof/xtensa.h>
 #include "../ops.h"
 #include "hda.h"
-#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_AUDIO_CODEC)
-#include "../../codecs/hdac_hda.h"
-#endif
 
 #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
 #include <sound/soc-acpi-intel-match.h>
@@ -31,6 +31,8 @@
 
 /* platform specific devices */
 #include "shim.h"
+
+#define EXCEPT_MAX_HDR_SIZE	0x400
 
 /*
  * Debug
@@ -40,6 +42,23 @@ struct hda_dsp_msg_code {
 	u32 code;
 	const char *msg;
 };
+
+static bool hda_use_msi = IS_ENABLED(CONFIG_PCI);
+#if IS_ENABLED(CONFIG_SND_SOC_SOF_DEBUG)
+module_param_named(use_msi, hda_use_msi, bool, 0444);
+MODULE_PARM_DESC(use_msi, "SOF HDA use PCI MSI mode");
+#endif
+
+#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
+static int hda_dmic_num = -1;
+module_param_named(dmic_num, hda_dmic_num, int, 0444);
+MODULE_PARM_DESC(dmic_num, "SOF HDA DMIC number");
+
+static bool hda_codec_use_common_hdmi =
+	IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_COMMON_HDMI_CODEC);
+module_param_named(use_common_hdmi, hda_codec_use_common_hdmi, bool, 0444);
+MODULE_PARM_DESC(use_common_hdmi, "SOF HDA use common HDMI codec driver");
+#endif
 
 static const struct hda_dsp_msg_code hda_dsp_rom_msg[] = {
 	{HDA_DSP_ROM_FW_MANIFEST_LOADED, "status: manifest loaded"},
@@ -108,17 +127,26 @@ static void hda_dsp_get_registers(struct snd_sof_dev *sdev,
 				  struct sof_ipc_panic_info *panic_info,
 				  u32 *stack, size_t stack_words)
 {
+	u32 offset = sdev->dsp_oops_offset;
+
 	/* first read registers */
-	sof_block_read(sdev, sdev->mmio_bar, sdev->dsp_oops_offset, xoops,
-		       sizeof(*xoops));
+	sof_mailbox_read(sdev, offset, xoops, sizeof(*xoops));
+
+	/* note: variable AR register array is not read */
 
 	/* then get panic info */
-	sof_block_read(sdev, sdev->mmio_bar, sdev->dsp_oops_offset +
-		       sizeof(*xoops), panic_info, sizeof(*panic_info));
+	if (xoops->arch_hdr.totalsize > EXCEPT_MAX_HDR_SIZE) {
+		dev_err(sdev->dev, "invalid header size 0x%x. FW oops is bogus\n",
+			xoops->arch_hdr.totalsize);
+		return;
+	}
+	offset += xoops->arch_hdr.totalsize;
+	sof_block_read(sdev, sdev->mmio_bar, offset,
+		       panic_info, sizeof(*panic_info));
 
 	/* then get the stack */
-	sof_block_read(sdev, sdev->mmio_bar, sdev->dsp_oops_offset +
-		       sizeof(*xoops) + sizeof(*panic_info), stack,
+	offset += sizeof(*panic_info);
+	sof_block_read(sdev, sdev->mmio_bar, offset, stack,
 		       stack_words * sizeof(u32));
 }
 
@@ -140,7 +168,7 @@ void hda_dsp_dump_skl(struct snd_sof_dev *sdev, u32 flags)
 	panic = snd_sof_dsp_read(sdev, HDA_DSP_BAR,
 				 HDA_ADSP_ERROR_CODE_SKL + 0x4);
 
-	if (sdev->boot_complete) {
+	if (sdev->fw_state == SOF_FW_BOOT_COMPLETE) {
 		hda_dsp_get_registers(sdev, &xoops, &panic_info, stack,
 				      HDA_DSP_STACK_DUMP_SIZE);
 		snd_sof_get_status(sdev, status, panic, &xoops, &panic_info,
@@ -167,7 +195,7 @@ void hda_dsp_dump(struct snd_sof_dev *sdev, u32 flags)
 				  HDA_DSP_SRAM_REG_FW_STATUS);
 	panic = snd_sof_dsp_read(sdev, HDA_DSP_BAR, HDA_DSP_SRAM_REG_FW_TRACEP);
 
-	if (sdev->boot_complete) {
+	if (sdev->fw_state == SOF_FW_BOOT_COMPLETE) {
 		hda_dsp_get_registers(sdev, &xoops, &panic_info, stack,
 				      HDA_DSP_STACK_DUMP_SIZE);
 		snd_sof_get_status(sdev, status, panic, &xoops, &panic_info,
@@ -179,11 +207,37 @@ void hda_dsp_dump(struct snd_sof_dev *sdev, u32 flags)
 	}
 }
 
+void hda_ipc_irq_dump(struct snd_sof_dev *sdev)
+{
+	struct hdac_bus *bus = sof_to_bus(sdev);
+	u32 adspis;
+	u32 intsts;
+	u32 intctl;
+	u32 ppsts;
+	u8 rirbsts;
+
+	/* read key IRQ stats and config registers */
+	adspis = snd_sof_dsp_read(sdev, HDA_DSP_BAR, HDA_DSP_REG_ADSPIS);
+	intsts = snd_sof_dsp_read(sdev, HDA_DSP_HDA_BAR, SOF_HDA_INTSTS);
+	intctl = snd_sof_dsp_read(sdev, HDA_DSP_HDA_BAR, SOF_HDA_INTCTL);
+	ppsts = snd_sof_dsp_read(sdev, HDA_DSP_PP_BAR, SOF_HDA_REG_PP_PPSTS);
+	rirbsts = snd_hdac_chip_readb(bus, RIRBSTS);
+
+	dev_err(sdev->dev,
+		"error: hda irq intsts 0x%8.8x intlctl 0x%8.8x rirb %2.2x\n",
+		intsts, intctl, rirbsts);
+	dev_err(sdev->dev,
+		"error: dsp irq ppsts 0x%8.8x adspis 0x%8.8x\n",
+		ppsts, adspis);
+}
+
 void hda_ipc_dump(struct snd_sof_dev *sdev)
 {
 	u32 hipcie;
 	u32 hipct;
 	u32 hipcctl;
+
+	hda_ipc_irq_dump(sdev);
 
 	/* read IPC status */
 	hipcie = snd_sof_dsp_read(sdev, HDA_DSP_BAR, HDA_DSP_REG_HIPCIE);
@@ -201,7 +255,6 @@ static int hda_init(struct snd_sof_dev *sdev)
 {
 	struct hda_bus *hbus;
 	struct hdac_bus *bus;
-	struct hdac_ext_bus_ops *ext_ops = NULL;
 	struct pci_dev *pci = to_pci_dev(sdev->dev);
 	int ret;
 
@@ -209,12 +262,11 @@ static int hda_init(struct snd_sof_dev *sdev)
 	bus = sof_to_bus(sdev);
 
 	/* HDA bus init */
-#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA_AUDIO_CODEC)
-	ext_ops = snd_soc_hdac_hda_get_ops();
-#endif
-	sof_hda_bus_init(bus, &pci->dev, ext_ops);
+	sof_hda_bus_init(bus, &pci->dev);
+
 	bus->use_posbuf = 1;
 	bus->bdl_pos_adj = 0;
+	bus->sync_write = 1;
 
 	mutex_init(&hbus->prepare_mutex);
 	hbus->pci = pci;
@@ -223,7 +275,9 @@ static int hda_init(struct snd_sof_dev *sdev)
 
 	/* initialise hdac bus */
 	bus->addr = pci_resource_start(pci, 0);
+#if IS_ENABLED(CONFIG_PCI)
 	bus->remap_addr = pci_ioremap_bar(pci, 0);
+#endif
 	if (!bus->remap_addr) {
 		dev_err(bus->dev, "error: ioremap error\n");
 		return -ENXIO;
@@ -231,6 +285,13 @@ static int hda_init(struct snd_sof_dev *sdev)
 
 	/* HDA base */
 	sdev->bar[HDA_DSP_HDA_BAR] = bus->remap_addr;
+
+	/* init i915 and HDMI codecs */
+	ret = hda_codec_i915_init(sdev);
+	if (ret < 0) {
+		dev_err(sdev->dev, "error: init i915 and HDMI codec failed\n");
+		return ret;
+	}
 
 	/* get controller capabilities */
 	ret = hda_dsp_ctrl_get_caps(sdev);
@@ -242,8 +303,26 @@ static int hda_init(struct snd_sof_dev *sdev)
 
 #if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
 
+static int check_nhlt_dmic(struct snd_sof_dev *sdev)
+{
+	struct nhlt_acpi_table *nhlt;
+	int dmic_num;
+
+	nhlt = intel_nhlt_init(sdev->dev);
+	if (nhlt) {
+		dmic_num = intel_nhlt_get_dmic_geo(sdev->dev, nhlt);
+		intel_nhlt_free(nhlt);
+		if (dmic_num == 2 || dmic_num == 4)
+			return dmic_num;
+	}
+
+	return 0;
+}
+
 static const char *fixup_tplg_name(struct snd_sof_dev *sdev,
-				   const char *sof_tplg_filename)
+				   const char *sof_tplg_filename,
+				   const char *idisp_str,
+				   const char *dmic_str)
 {
 	const char *tplg_filename = NULL;
 	char *filename;
@@ -257,25 +336,23 @@ static const char *fixup_tplg_name(struct snd_sof_dev *sdev,
 	split_ext = strsep(&filename, ".");
 	if (split_ext) {
 		tplg_filename = devm_kasprintf(sdev->dev, GFP_KERNEL,
-					       "%s-idisp.tplg", split_ext);
+					       "%s%s%s.tplg",
+					       split_ext, idisp_str, dmic_str);
 		if (!tplg_filename)
 			return NULL;
 	}
 	return tplg_filename;
 }
 
+#endif
+
 static int hda_init_caps(struct snd_sof_dev *sdev)
 {
 	struct hdac_bus *bus = sof_to_bus(sdev);
+#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
 	struct hdac_ext_link *hlink;
-	struct snd_soc_acpi_mach_params *mach_params;
-	struct snd_soc_acpi_mach *hda_mach;
-	struct snd_sof_pdata *pdata = sdev->pdata;
-	struct snd_soc_acpi_mach *mach;
-	const char *tplg_filename;
-	int codec_num = 0;
+#endif
 	int ret = 0;
-	int i;
 
 	device_disable_async_suspend(bus->dev);
 
@@ -283,115 +360,35 @@ static int hda_init_caps(struct snd_sof_dev *sdev)
 	if (bus->ppcap)
 		dev_dbg(sdev->dev, "PP capability, will probe DSP later.\n");
 
-	if (bus->mlcap)
-		snd_hdac_ext_bus_get_ml_capabilities(bus);
-
-	/* init i915 and HDMI codecs */
-	ret = hda_codec_i915_init(sdev);
+	/* Init HDA controller after i915 init */
+	ret = hda_dsp_ctrl_init_chip(sdev, true);
 	if (ret < 0) {
-		dev_err(sdev->dev, "error: no HDMI audio devices found\n");
+		dev_err(bus->dev, "error: init chip failed with ret: %d\n",
+			ret);
+#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
+		hda_codec_i915_exit(sdev);
+#endif
 		return ret;
 	}
 
-	ret = hda_dsp_ctrl_init_chip(sdev, true);
-	if (ret < 0) {
-		dev_err(bus->dev, "error: init chip failed with ret: %d\n", ret);
-		goto out;
-	}
-
-	/* codec detection */
-	if (!bus->codec_mask) {
-		dev_info(bus->dev, "no hda codecs found!\n");
-	} else {
-		dev_info(bus->dev, "hda codecs found, mask %lx\n",
-			 bus->codec_mask);
-
-		for (i = 0; i < HDA_MAX_CODECS; i++) {
-			if (bus->codec_mask & (1 << i))
-				codec_num++;
-		}
-
-		/*
-		 * If no machine driver is found, then:
-		 *
-		 * hda machine driver is used if :
-		 * 1. there is one HDMI codec and one external HDAudio codec
-		 * 2. only HDMI codec
-		 */
-		if (!pdata->machine && codec_num <= 2 &&
-		    HDA_IDISP_CODEC(bus->codec_mask)) {
-			hda_mach = snd_soc_acpi_intel_hda_machines;
-			pdata->machine = hda_mach;
-
-			/* topology: use the info from hda_machines */
-			pdata->tplg_filename =
-				hda_mach->sof_tplg_filename;
-
-			/* firmware: pick the first in machine list */
-			mach = pdata->desc->machines;
-			pdata->fw_filename = mach->sof_fw_filename;
-
-			dev_info(bus->dev, "using HDA machine driver %s now\n",
-				 hda_mach->drv_name);
-
-			/* fixup topology file for HDMI only platforms */
-			if (codec_num == 1) {
-				/* use local variable for readability */
-				tplg_filename = pdata->tplg_filename;
-				tplg_filename = fixup_tplg_name(sdev, tplg_filename);
-				if (!tplg_filename)
-					goto out;
-				pdata->tplg_filename = tplg_filename;
-			}
-		}
-	}
-
-	/* used by hda machine driver to create dai links */
-	if (pdata->machine) {
-		mach_params = (struct snd_soc_acpi_mach_params *)
-			&pdata->machine->mach_params;
-		mach_params->codec_mask = bus->codec_mask;
-		mach_params->platform = dev_name(sdev->dev);
-	}
+#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
+	if (bus->mlcap)
+		snd_hdac_ext_bus_get_ml_capabilities(bus);
 
 	/* create codec instances */
-	hda_codec_probe_bus(sdev);
+	hda_codec_probe_bus(sdev, hda_codec_use_common_hdmi);
 
-	hda_codec_i915_put(sdev);
+	if (!HDA_IDISP_CODEC(bus->codec_mask))
+		hda_codec_i915_exit(sdev);
 
 	/*
 	 * we are done probing so decrement link counts
 	 */
 	list_for_each_entry(hlink, &bus->hlink_list, list)
 		snd_hdac_ext_bus_link_put(bus, hlink);
-
-	return 0;
-
-out:
-	hda_codec_i915_exit(sdev);
-	return ret;
-}
-
-#else
-
-static int hda_init_caps(struct snd_sof_dev *sdev)
-{
-	/*
-	 * set CGCTL.MISCBDCGE to 0 during reset and set back to 1
-	 * when reset finished.
-	 * TODO: maybe no need for init_caps?
-	 */
-	hda_dsp_ctrl_misc_clock_gating(sdev, 0);
-
-	/* clear WAKESTS */
-	snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR, SOF_HDA_WAKESTS,
-				SOF_HDA_WAKESTS_INT_MASK,
-				SOF_HDA_WAKESTS_INT_MASK);
-
-	return 0;
-}
-
 #endif
+	return 0;
+}
 
 static const struct sof_intel_dsp_desc
 	*get_chip_info(struct snd_sof_pdata *pdata)
@@ -404,14 +401,56 @@ static const struct sof_intel_dsp_desc
 	return chip_info;
 }
 
+static irqreturn_t hda_dsp_interrupt_handler(int irq, void *context)
+{
+	struct snd_sof_dev *sdev = context;
+
+	/*
+	 * Get global interrupt status. It includes all hardware interrupt
+	 * sources in the Intel HD Audio controller.
+	 */
+	if (snd_sof_dsp_read(sdev, HDA_DSP_HDA_BAR, SOF_HDA_INTSTS) &
+	    SOF_HDA_INTSTS_GIS) {
+
+		/* disable GIE interrupt */
+		snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
+					SOF_HDA_INTCTL,
+					SOF_HDA_INT_GLOBAL_EN,
+					0);
+
+		return IRQ_WAKE_THREAD;
+	}
+
+	return IRQ_NONE;
+}
+
+static irqreturn_t hda_dsp_interrupt_thread(int irq, void *context)
+{
+	struct snd_sof_dev *sdev = context;
+
+	/* deal with streams and controller first */
+	if (hda_dsp_check_stream_irq(sdev))
+		hda_dsp_stream_threaded_handler(irq, sdev);
+
+	if (hda_dsp_check_ipc_irq(sdev))
+		sof_ops(sdev)->irq_thread(irq, sdev);
+
+	/* enable GIE interrupt */
+	snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
+				SOF_HDA_INTCTL,
+				SOF_HDA_INT_GLOBAL_EN,
+				SOF_HDA_INT_GLOBAL_EN);
+
+	return IRQ_HANDLED;
+}
+
 int hda_dsp_probe(struct snd_sof_dev *sdev)
 {
 	struct pci_dev *pci = to_pci_dev(sdev->dev);
 	struct sof_intel_hda_dev *hdev;
 	struct hdac_bus *bus;
-	struct hdac_stream *stream;
 	const struct sof_intel_dsp_desc *chip;
-	int sd_offset, ret = 0;
+	int ret = 0;
 
 	/*
 	 * detect DSP by checking class/subclass/prog-id information
@@ -468,7 +507,9 @@ int hda_dsp_probe(struct snd_sof_dev *sdev)
 		goto hdac_bus_unmap;
 
 	/* DSP base */
+#if IS_ENABLED(CONFIG_PCI)
 	sdev->bar[HDA_DSP_BAR] = pci_ioremap_bar(pci, HDA_DSP_BAR);
+#endif
 	if (!sdev->bar[HDA_DSP_BAR]) {
 		dev_err(sdev->dev, "error: ioremap error\n");
 		ret = -ENXIO;
@@ -503,45 +544,32 @@ int hda_dsp_probe(struct snd_sof_dev *sdev)
 	 * register our IRQ
 	 * let's try to enable msi firstly
 	 * if it fails, use legacy interrupt mode
-	 * TODO: support interrupt mode selection with kernel parameter
-	 *       support msi multiple vectors
+	 * TODO: support msi multiple vectors
 	 */
-	ret = pci_alloc_irq_vectors(pci, 1, 1, PCI_IRQ_MSI);
-	if (ret < 0) {
+	if (hda_use_msi && pci_alloc_irq_vectors(pci, 1, 1, PCI_IRQ_MSI) > 0) {
+		dev_info(sdev->dev, "use msi interrupt mode\n");
+		sdev->ipc_irq = pci_irq_vector(pci, 0);
+		/* initialised to "false" by kzalloc() */
+		sdev->msi_enabled = true;
+	}
+
+	if (!sdev->msi_enabled) {
 		dev_info(sdev->dev, "use legacy interrupt mode\n");
 		/*
 		 * in IO-APIC mode, hda->irq and ipc_irq are using the same
 		 * irq number of pci->irq
 		 */
-		hdev->irq = pci->irq;
 		sdev->ipc_irq = pci->irq;
-		sdev->msi_enabled = 0;
-	} else {
-		dev_info(sdev->dev, "use msi interrupt mode\n");
-		hdev->irq = pci_irq_vector(pci, 0);
-		/* ipc irq number is the same of hda irq */
-		sdev->ipc_irq = hdev->irq;
-		sdev->msi_enabled = 1;
-	}
-
-	dev_dbg(sdev->dev, "using HDA IRQ %d\n", hdev->irq);
-	ret = request_threaded_irq(hdev->irq, hda_dsp_stream_interrupt,
-				   hda_dsp_stream_threaded_handler,
-				   IRQF_SHARED, "AudioHDA", bus);
-	if (ret < 0) {
-		dev_err(sdev->dev, "error: failed to register HDA IRQ %d\n",
-			hdev->irq);
-		goto free_irq_vector;
 	}
 
 	dev_dbg(sdev->dev, "using IPC IRQ %d\n", sdev->ipc_irq);
-	ret = request_threaded_irq(sdev->ipc_irq, hda_dsp_ipc_irq_handler,
-				   sof_ops(sdev)->irq_thread, IRQF_SHARED,
-				   "AudioDSP", sdev);
+	ret = request_threaded_irq(sdev->ipc_irq, hda_dsp_interrupt_handler,
+				   hda_dsp_interrupt_thread,
+				   IRQF_SHARED, "AudioDSP", sdev);
 	if (ret < 0) {
 		dev_err(sdev->dev, "error: failed to register IPC IRQ %d\n",
 			sdev->ipc_irq);
-		goto free_hda_irq;
+		goto free_irq_vector;
 	}
 
 	pci_set_master(pci);
@@ -558,56 +586,9 @@ int hda_dsp_probe(struct snd_sof_dev *sdev)
 	if (ret < 0)
 		goto free_ipc_irq;
 
-	/* reset HDA controller */
-	ret = hda_dsp_ctrl_link_reset(sdev, true);
-	if (ret < 0) {
-		dev_err(sdev->dev, "error: failed to reset HDA controller\n");
-		goto free_ipc_irq;
-	}
-
-	/* exit HDA controller reset */
-	ret = hda_dsp_ctrl_link_reset(sdev, false);
-	if (ret < 0) {
-		dev_err(sdev->dev, "error: failed to exit HDA controller reset\n");
-		goto free_ipc_irq;
-	}
-
-	/* clear stream status */
-	list_for_each_entry(stream, &bus->stream_list, list) {
-		sd_offset = SOF_STREAM_SD_OFFSET(stream);
-		snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
-					sd_offset +
-					SOF_HDA_ADSP_REG_CL_SD_STS,
-					SOF_HDA_CL_DMA_SD_INT_MASK,
-					SOF_HDA_CL_DMA_SD_INT_MASK);
-	}
-
-	/* clear WAKESTS */
-	snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR, SOF_HDA_WAKESTS,
-				SOF_HDA_WAKESTS_INT_MASK,
-				SOF_HDA_WAKESTS_INT_MASK);
-
-	/* clear interrupt status register */
-	snd_sof_dsp_write(sdev, HDA_DSP_HDA_BAR, SOF_HDA_INTSTS,
-			  SOF_HDA_INT_CTRL_EN | SOF_HDA_INT_ALL_STREAM);
-
-	/* enable CIE and GIE interrupts */
-	snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR, SOF_HDA_INTCTL,
-				SOF_HDA_INT_CTRL_EN | SOF_HDA_INT_GLOBAL_EN,
-				SOF_HDA_INT_CTRL_EN | SOF_HDA_INT_GLOBAL_EN);
-
-	/* re-enable CGCTL.MISCBDCGE after reset */
-	hda_dsp_ctrl_misc_clock_gating(sdev, true);
-
-	device_disable_async_suspend(&pci->dev);
-
-	/* enable DSP features */
-	snd_sof_dsp_update_bits(sdev, HDA_DSP_PP_BAR, SOF_HDA_REG_PP_PPCTL,
-				SOF_HDA_PPCTL_GPROCEN, SOF_HDA_PPCTL_GPROCEN);
-
-	/* enable DSP IRQ */
-	snd_sof_dsp_update_bits(sdev, HDA_DSP_PP_BAR, SOF_HDA_REG_PP_PPCTL,
-				SOF_HDA_PPCTL_PIE, SOF_HDA_PPCTL_PIE);
+	/* enable ppcap interrupt */
+	hda_dsp_ctrl_ppcap_enable(sdev, true);
+	hda_dsp_ctrl_ppcap_int_enable(sdev, true);
 
 	/* initialize waitq for code loading */
 	init_waitqueue_head(&sdev->waitq);
@@ -619,8 +600,6 @@ int hda_dsp_probe(struct snd_sof_dev *sdev)
 
 free_ipc_irq:
 	free_irq(sdev->ipc_irq, sdev);
-free_hda_irq:
-	free_irq(hdev->irq, bus);
 free_irq_vector:
 	if (sdev->msi_enabled)
 		pci_free_irq_vectors(pci);
@@ -630,6 +609,7 @@ free_streams:
 	iounmap(sdev->bar[HDA_DSP_BAR]);
 hdac_bus_unmap:
 	iounmap(bus->remap_addr);
+	hda_codec_i915_exit(sdev);
 err:
 	return ret;
 }
@@ -666,7 +646,6 @@ int hda_dsp_remove(struct snd_sof_dev *sdev)
 				SOF_HDA_PPCTL_GPROCEN, 0);
 
 	free_irq(sdev->ipc_irq, sdev);
-	free_irq(hda->irq, bus);
 	if (sdev->msi_enabled)
 		pci_free_irq_vectors(pci);
 
@@ -686,4 +665,136 @@ int hda_dsp_remove(struct snd_sof_dev *sdev)
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_SND_SOC_SOF_HDA)
+static int hda_generic_machine_select(struct snd_sof_dev *sdev)
+{
+	struct hdac_bus *bus = sof_to_bus(sdev);
+	struct snd_soc_acpi_mach_params *mach_params;
+	struct snd_soc_acpi_mach *hda_mach;
+	struct snd_sof_pdata *pdata = sdev->pdata;
+	const char *tplg_filename;
+	const char *idisp_str;
+	const char *dmic_str;
+	int dmic_num = 0;
+	int codec_num = 0;
+	int i;
+
+	/* codec detection */
+	if (!bus->codec_mask) {
+		dev_info(bus->dev, "no hda codecs found!\n");
+	} else {
+		dev_info(bus->dev, "hda codecs found, mask %lx\n",
+			 bus->codec_mask);
+
+		for (i = 0; i < HDA_MAX_CODECS; i++) {
+			if (bus->codec_mask & (1 << i))
+				codec_num++;
+		}
+
+		/*
+		 * If no machine driver is found, then:
+		 *
+		 * hda machine driver is used if :
+		 * 1. there is one HDMI codec and one external HDAudio codec
+		 * 2. only HDMI codec
+		 */
+		if (!pdata->machine && codec_num <= 2 &&
+		    HDA_IDISP_CODEC(bus->codec_mask)) {
+			hda_mach = snd_soc_acpi_intel_hda_machines;
+
+			/* topology: use the info from hda_machines */
+			pdata->tplg_filename =
+				hda_mach->sof_tplg_filename;
+
+			dev_info(bus->dev, "using HDA machine driver %s now\n",
+				 hda_mach->drv_name);
+
+			if (codec_num == 1)
+				idisp_str = "-idisp";
+			else
+				idisp_str = "";
+
+			/* first check NHLT for DMICs */
+			dmic_num = check_nhlt_dmic(sdev);
+
+			/* allow for module parameter override */
+			if (hda_dmic_num != -1)
+				dmic_num = hda_dmic_num;
+
+			switch (dmic_num) {
+			case 2:
+				dmic_str = "-2ch";
+				break;
+			case 4:
+				dmic_str = "-4ch";
+				break;
+			default:
+				dmic_num = 0;
+				dmic_str = "";
+				break;
+			}
+
+			tplg_filename = pdata->tplg_filename;
+			tplg_filename = fixup_tplg_name(sdev, tplg_filename,
+							idisp_str, dmic_str);
+			if (!tplg_filename)
+				return -EINVAL;
+
+			pdata->machine = hda_mach;
+			pdata->tplg_filename = tplg_filename;
+		}
+	}
+
+	/* used by hda machine driver to create dai links */
+	if (pdata->machine) {
+		mach_params = (struct snd_soc_acpi_mach_params *)
+			&pdata->machine->mach_params;
+		mach_params->codec_mask = bus->codec_mask;
+		mach_params->common_hdmi_codec_drv = hda_codec_use_common_hdmi;
+		mach_params->dmic_num = dmic_num;
+	}
+
+	return 0;
+}
+#else
+static int hda_generic_machine_select(struct snd_sof_dev *sdev)
+{
+	return 0;
+}
+#endif
+
+void hda_set_mach_params(const struct snd_soc_acpi_mach *mach,
+			 struct device *dev)
+{
+	struct snd_soc_acpi_mach_params *mach_params;
+
+	mach_params = (struct snd_soc_acpi_mach_params *)&mach->mach_params;
+	mach_params->platform = dev_name(dev);
+}
+
+void hda_machine_select(struct snd_sof_dev *sdev)
+{
+	struct snd_sof_pdata *sof_pdata = sdev->pdata;
+	const struct sof_dev_desc *desc = sof_pdata->desc;
+	struct snd_soc_acpi_mach *mach;
+
+	mach = snd_soc_acpi_find_machine(desc->machines);
+	if (mach) {
+		sof_pdata->tplg_filename = mach->sof_tplg_filename;
+		sof_pdata->machine = mach;
+	}
+
+	/*
+	 * Choose HDA generic machine driver if mach is NULL.
+	 * Otherwise, set certain mach params.
+	 */
+	hda_generic_machine_select(sdev);
+
+	if (!sof_pdata->machine)
+		dev_warn(sdev->dev, "warning: No matching ASoC machine driver found\n");
+}
+
 MODULE_LICENSE("Dual BSD/GPL");
+MODULE_IMPORT_NS(SND_SOC_SOF_HDA_AUDIO_CODEC);
+MODULE_IMPORT_NS(SND_SOC_SOF_HDA_AUDIO_CODEC_I915);
+MODULE_IMPORT_NS(SND_SOC_SOF_XTENSA);

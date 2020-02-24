@@ -50,6 +50,7 @@
 #include <linux/debugfs.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
+#include <linux/vmalloc.h>
 
 #include <linux/uaccess.h>
 #include <asm/io.h>
@@ -255,7 +256,7 @@ notrace void arch_local_irq_restore(unsigned long mask)
 	irq_happened = get_irq_happened();
 	if (!irq_happened) {
 #ifdef CONFIG_PPC_IRQ_SOFT_MASK_DEBUG
-		WARN_ON(!(mfmsr() & MSR_EE));
+		WARN_ON_ONCE(!(mfmsr() & MSR_EE));
 #endif
 		return;
 	}
@@ -268,7 +269,7 @@ notrace void arch_local_irq_restore(unsigned long mask)
 	 */
 	if (!(irq_happened & PACA_IRQ_HARD_DIS)) {
 #ifdef CONFIG_PPC_IRQ_SOFT_MASK_DEBUG
-		WARN_ON(!(mfmsr() & MSR_EE));
+		WARN_ON_ONCE(!(mfmsr() & MSR_EE));
 #endif
 		__hard_irq_disable();
 #ifdef CONFIG_PPC_IRQ_SOFT_MASK_DEBUG
@@ -279,7 +280,7 @@ notrace void arch_local_irq_restore(unsigned long mask)
 		 * warn if we are wrong. Only do that when IRQ tracing
 		 * is enabled as mfmsr() can be costly.
 		 */
-		if (WARN_ON(mfmsr() & MSR_EE))
+		if (WARN_ON_ONCE(mfmsr() & MSR_EE))
 			__hard_irq_disable();
 #endif
 	}
@@ -619,8 +620,6 @@ void __do_irq(struct pt_regs *regs)
 
 	trace_irq_entry(regs);
 
-	check_stack_overflow();
-
 	/*
 	 * Query the platform PIC for the interrupt & ack it.
 	 *
@@ -652,6 +651,8 @@ void do_IRQ(struct pt_regs *regs)
 	irqsp = hardirq_ctx[raw_smp_processor_id()];
 	sirqsp = softirq_ctx[raw_smp_processor_id()];
 
+	check_stack_overflow();
+
 	/* Already there ? */
 	if (unlikely(cursp == irqsp || cursp == sirqsp)) {
 		__do_irq(regs);
@@ -664,8 +665,29 @@ void do_IRQ(struct pt_regs *regs)
 	set_irq_regs(old_regs);
 }
 
+static void *__init alloc_vm_stack(void)
+{
+	return __vmalloc_node_range(THREAD_SIZE, THREAD_ALIGN, VMALLOC_START,
+				    VMALLOC_END, THREADINFO_GFP, PAGE_KERNEL,
+				     0, NUMA_NO_NODE, (void*)_RET_IP_);
+}
+
+static void __init vmap_irqstack_init(void)
+{
+	int i;
+
+	for_each_possible_cpu(i) {
+		softirq_ctx[i] = alloc_vm_stack();
+		hardirq_ctx[i] = alloc_vm_stack();
+	}
+}
+
+
 void __init init_IRQ(void)
 {
+	if (IS_ENABLED(CONFIG_VMAP_STACK))
+		vmap_irqstack_init();
+
 	if (ppc_md.init_IRQ)
 		ppc_md.init_IRQ();
 }

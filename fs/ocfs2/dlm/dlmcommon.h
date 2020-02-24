@@ -142,7 +142,6 @@ struct dlm_ctxt
 	atomic_t res_tot_count;
 	atomic_t res_cur_count;
 
-	struct dlm_debug_ctxt *dlm_debug_ctxt;
 	struct dentry *dlm_debugfs_subroot;
 
 	/* NOTE: Next three are protected by dlm_domain_lock */
@@ -688,10 +687,6 @@ struct dlm_begin_reco
 	__be16 pad1;
 	__be32 pad2;
 };
-
-
-#define BITS_PER_BYTE 8
-#define BITS_TO_BYTES(bits) (((bits)+BITS_PER_BYTE-1)/BITS_PER_BYTE)
 
 struct dlm_query_join_request
 {

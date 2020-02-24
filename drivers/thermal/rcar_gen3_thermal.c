@@ -182,9 +182,7 @@ static int rcar_gen3_thermal_get_temp(void *devdata, int *temp)
 				tsc->coef.a2);
 	mcelsius = FIXPT_TO_MCELSIUS(val);
 
-	/* Make sure we are inside specifications */
-	if ((mcelsius < MCELSIUS(-40)) || (mcelsius > MCELSIUS(125)))
-		return -EIO;
+	/* Guaranteed operating range is -40C to 125C. */
 
 	/* Round value to device granularity setting */
 	*temp = rcar_gen3_thermal_round(mcelsius);
@@ -315,6 +313,10 @@ static const struct of_device_id rcar_gen3_thermal_dt_ids[] = {
 		.data = &rcar_gen3_ths_tj_1_m3_w,
 	},
 	{
+		.compatible = "renesas,r8a774b1-thermal",
+		.data = &rcar_gen3_ths_tj_1,
+	},
+	{
 		.compatible = "renesas,r8a7795-thermal",
 		.data = &rcar_gen3_ths_tj_1,
 	},
@@ -443,9 +445,8 @@ static int rcar_gen3_thermal_probe(struct platform_device *pdev)
 		if (ret)
 			goto error_unregister;
 
-		ret = devm_add_action(dev, rcar_gen3_hwmon_action, zone);
+		ret = devm_add_action_or_reset(dev, rcar_gen3_hwmon_action, zone);
 		if (ret) {
-			rcar_gen3_hwmon_action(zone);
 			goto error_unregister;
 		}
 

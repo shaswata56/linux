@@ -213,6 +213,14 @@ extern void ptp_clock_event(struct ptp_clock *ptp,
 extern int ptp_clock_index(struct ptp_clock *ptp);
 
 /**
+ * scaled_ppm_to_ppb() - convert scaled ppm to ppb
+ *
+ * @ppm:    Parts per million, but with a 16 bit binary fractional field
+ */
+
+extern s32 scaled_ppm_to_ppb(long ppm);
+
+/**
  * ptp_find_pin() - obtain the pin index of a given auxiliary function
  *
  * @ptp:    The clock obtained from ptp_clock_register().
@@ -235,6 +243,13 @@ int ptp_find_pin(struct ptp_clock *ptp,
 
 int ptp_schedule_worker(struct ptp_clock *ptp, unsigned long delay);
 
+/**
+ * ptp_cancel_worker_sync() - cancel ptp auxiliary clock
+ *
+ * @ptp:     The clock obtained from ptp_clock_register().
+ */
+void ptp_cancel_worker_sync(struct ptp_clock *ptp);
+
 #else
 static inline struct ptp_clock *ptp_clock_register(struct ptp_clock_info *info,
 						   struct device *parent)
@@ -252,6 +267,8 @@ static inline int ptp_find_pin(struct ptp_clock *ptp,
 static inline int ptp_schedule_worker(struct ptp_clock *ptp,
 				      unsigned long delay)
 { return -EOPNOTSUPP; }
+static inline void ptp_cancel_worker_sync(struct ptp_clock *ptp)
+{ }
 
 #endif
 

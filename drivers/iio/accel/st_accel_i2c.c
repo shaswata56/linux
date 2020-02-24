@@ -18,7 +18,6 @@
 #include <linux/iio/common/st_sensors_i2c.h>
 #include "st_accel.h"
 
-#ifdef CONFIG_OF
 static const struct of_device_id st_accel_of_match[] = {
 	{
 		/* An older compatible */
@@ -108,9 +107,6 @@ static const struct of_device_id st_accel_of_match[] = {
 	{},
 };
 MODULE_DEVICE_TABLE(of, st_accel_of_match);
-#else
-#define st_accel_of_match NULL
-#endif
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id st_accel_acpi_match[] = {
@@ -119,8 +115,6 @@ static const struct acpi_device_id st_accel_acpi_match[] = {
 	{ },
 };
 MODULE_DEVICE_TABLE(acpi, st_accel_acpi_match);
-#else
-#define st_accel_acpi_match NULL
 #endif
 
 static const struct i2c_device_id st_accel_id_table[] = {
@@ -150,22 +144,33 @@ MODULE_DEVICE_TABLE(i2c, st_accel_id_table);
 
 static int st_accel_i2c_probe(struct i2c_client *client)
 {
-	struct iio_dev *indio_dev;
+	const struct st_sensor_settings *settings;
 	struct st_sensor_data *adata;
+	struct iio_dev *indio_dev;
 	const char *match;
 	int ret;
+
+	match = device_get_match_data(&client->dev);
+	if (match)
+		strlcpy(client->name, match, sizeof(client->name));
+
+	settings = st_accel_get_settings(client->name);
+	if (!settings) {
+		dev_err(&client->dev, "device name %s not recognized.\n",
+			client->name);
+		return -ENODEV;
+	}
 
 	indio_dev = devm_iio_device_alloc(&client->dev, sizeof(*adata));
 	if (!indio_dev)
 		return -ENOMEM;
 
 	adata = iio_priv(indio_dev);
+	adata->sensor_settings = (struct st_sensor_settings *)settings;
 
-	match = device_get_match_data(&client->dev);
-	if (match)
-		strlcpy(client->name, match, sizeof(client->name));
-
-	st_sensors_i2c_configure(indio_dev, client, adata);
+	ret = st_sensors_i2c_configure(indio_dev, client);
+	if (ret < 0)
+		return ret;
 
 	ret = st_accel_common_probe(indio_dev);
 	if (ret < 0)
@@ -184,7 +189,7 @@ static int st_accel_i2c_remove(struct i2c_client *client)
 static struct i2c_driver st_accel_driver = {
 	.driver = {
 		.name = "st-accel-i2c",
-		.of_match_table = of_match_ptr(st_accel_of_match),
+		.of_match_table = st_accel_of_match,
 		.acpi_match_table = ACPI_PTR(st_accel_acpi_match),
 	},
 	.probe_new = st_accel_i2c_probe,

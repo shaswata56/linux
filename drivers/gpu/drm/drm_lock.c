@@ -1,4 +1,4 @@
-/**
+/*
  * \file drm_lock.c
  * IOCTLs for locking
  *
@@ -36,9 +36,13 @@
 #include <linux/export.h>
 #include <linux/sched/signal.h>
 
-#include <drm/drmP.h>
-#include "drm_legacy.h"
+#include <drm/drm.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_file.h>
+#include <drm/drm_print.h>
+
 #include "drm_internal.h"
+#include "drm_legacy.h"
 
 static int drm_lock_take(struct drm_lock_data *lock_data, unsigned int context);
 
@@ -356,7 +360,8 @@ void drm_legacy_lock_master_cleanup(struct drm_device *dev, struct drm_master *m
 	/*
 	 * Since the master is disappearing, so is the
 	 * possibility to lock.
-	 */	mutex_lock(&dev->struct_mutex);
+	 */
+	mutex_lock(&dev->struct_mutex);
 	if (master->lock.hw_lock) {
 		if (dev->sigdata.lock == master->lock.hw_lock)
 			dev->sigdata.lock = NULL;

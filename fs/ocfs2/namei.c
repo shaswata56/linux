@@ -586,8 +586,7 @@ static int __ocfs2_mknod_locked(struct inode *dir,
 			mlog_errno(status);
 	}
 
-	oi->i_sync_tid = handle->h_transaction->t_tid;
-	oi->i_datasync_tid = handle->h_transaction->t_tid;
+	ocfs2_update_inode_fsync_trans(handle, inode, 1);
 
 leave:
 	if (status < 0) {
@@ -2486,7 +2485,6 @@ int ocfs2_create_inode_in_orphan(struct inode *dir,
 	struct inode *inode = NULL;
 	struct inode *orphan_dir = NULL;
 	struct ocfs2_super *osb = OCFS2_SB(dir->i_sb);
-	struct ocfs2_dinode *di = NULL;
 	handle_t *handle = NULL;
 	char orphan_name[OCFS2_ORPHAN_NAMELEN + 1];
 	struct buffer_head *parent_di_bh = NULL;
@@ -2552,7 +2550,6 @@ int ocfs2_create_inode_in_orphan(struct inode *dir,
 		goto leave;
 	}
 
-	di = (struct ocfs2_dinode *)new_di_bh->b_data;
 	status = ocfs2_orphan_add(osb, handle, inode, new_di_bh, orphan_name,
 				  &orphan_insert, orphan_dir, false);
 	if (status < 0) {

@@ -130,20 +130,16 @@ static int defer_packet_queue(
 {
 	struct hfi1_user_sdma_pkt_q *pq =
 		container_of(wait->iow, struct hfi1_user_sdma_pkt_q, busy);
-	struct user_sdma_txreq *tx =
-		container_of(txreq, struct user_sdma_txreq, txreq);
 
-	if (sdma_progress(sde, seq, txreq)) {
-		if (tx->busycount++ < MAX_DEFER_RETRY_COUNT)
-			goto eagain;
-	}
+	write_seqlock(&sde->waitlock);
+	if (sdma_progress(sde, seq, txreq))
+		goto eagain;
 	/*
 	 * We are assuming that if the list is enqueued somewhere, it
 	 * is to the dmawait list since that is the only place where
 	 * it is supposed to be enqueued.
 	 */
 	xchg(&pq->state, SDMA_PKT_Q_DEFERRED);
-	write_seqlock(&sde->waitlock);
 	if (list_empty(&pq->busy.list)) {
 		iowait_get_priority(&pq->busy);
 		iowait_queue(pkts_sent, &pq->busy, &sde->dmawait);
@@ -151,6 +147,7 @@ static int defer_packet_queue(
 	write_sequnlock(&sde->waitlock);
 	return -EBUSY;
 eagain:
+	write_sequnlock(&sde->waitlock);
 	return -EAGAIN;
 }
 
@@ -182,7 +179,6 @@ int hfi1_user_sdma_alloc_queues(struct hfi1_ctxtdata *uctxt,
 	pq = kzalloc(sizeof(*pq), GFP_KERNEL);
 	if (!pq)
 		return -ENOMEM;
-
 	pq->dd = dd;
 	pq->ctxt = uctxt->ctxt;
 	pq->subctxt = fd->subctxt;
@@ -239,7 +235,7 @@ int hfi1_user_sdma_alloc_queues(struct hfi1_ctxtdata *uctxt,
 		goto pq_mmu_fail;
 	}
 
-	fd->pq = pq;
+	rcu_assign_pointer(fd->pq, pq);
 	fd->cq = cq;
 
 	return 0;
@@ -267,8 +263,14 @@ int hfi1_user_sdma_free_queues(struct hfi1_filedata *fd,
 
 	trace_hfi1_sdma_user_free_queues(uctxt->dd, uctxt->ctxt, fd->subctxt);
 
-	pq = fd->pq;
+	spin_lock(&fd->pq_rcu_lock);
+	pq = srcu_dereference_check(fd->pq, &fd->pq_srcu,
+				    lockdep_is_held(&fd->pq_rcu_lock));
 	if (pq) {
+		rcu_assign_pointer(fd->pq, NULL);
+		spin_unlock(&fd->pq_rcu_lock);
+		synchronize_srcu(&fd->pq_srcu);
+		/* at this point there can be no more new requests */
 		if (pq->handler)
 			hfi1_mmu_rb_unregister(pq->handler);
 		iowait_sdma_drain(&pq->busy);
@@ -280,7 +282,8 @@ int hfi1_user_sdma_free_queues(struct hfi1_filedata *fd,
 		kfree(pq->req_in_use);
 		kmem_cache_destroy(pq->txreq_cache);
 		kfree(pq);
-		fd->pq = NULL;
+	} else {
+		spin_unlock(&fd->pq_rcu_lock);
 	}
 	if (fd->cq) {
 		vfree(fd->cq->comps);
@@ -324,7 +327,8 @@ int hfi1_user_sdma_process_request(struct hfi1_filedata *fd,
 {
 	int ret = 0, i;
 	struct hfi1_ctxtdata *uctxt = fd->uctxt;
-	struct hfi1_user_sdma_pkt_q *pq = fd->pq;
+	struct hfi1_user_sdma_pkt_q *pq =
+		srcu_dereference(fd->pq, &fd->pq_srcu);
 	struct hfi1_user_sdma_comp_q *cq = fd->cq;
 	struct hfi1_devdata *dd = pq->dd;
 	unsigned long idx = 0;
@@ -804,7 +808,6 @@ static int user_sdma_send_pkts(struct user_sdma_request *req, u16 maxpkts)
 
 		tx->flags = 0;
 		tx->req = req;
-		tx->busycount = 0;
 		INIT_LIST_HEAD(&tx->list);
 
 		/*

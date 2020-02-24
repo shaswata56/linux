@@ -23,18 +23,19 @@
 #include <linux/platform_device.h>
 #include <linux/psci.h>
 #include <linux/slab.h>
+#include <linux/sys_soc.h>
 
 #include "core.h"
 
 static int sh_pfc_map_resources(struct sh_pfc *pfc,
 				struct platform_device *pdev)
 {
-	unsigned int num_windows, num_irqs;
 	struct sh_pfc_window *windows;
 	unsigned int *irqs = NULL;
+	unsigned int num_windows;
 	struct resource *res;
 	unsigned int i;
-	int irq;
+	int num_irqs;
 
 	/* Count the MEM and IRQ resources. */
 	for (num_windows = 0;; num_windows++) {
@@ -42,16 +43,12 @@ static int sh_pfc_map_resources(struct sh_pfc *pfc,
 		if (!res)
 			break;
 	}
-	for (num_irqs = 0;; num_irqs++) {
-		irq = platform_get_irq(pdev, num_irqs);
-		if (irq == -EPROBE_DEFER)
-			return irq;
-		if (irq < 0)
-			break;
-	}
-
 	if (num_windows == 0)
 		return -EINVAL;
+
+	num_irqs = platform_irq_count(pdev);
+	if (num_irqs < 0)
+		return num_irqs;
 
 	/* Allocate memory windows and IRQs arrays. */
 	windows = devm_kcalloc(pfc->dev, num_windows, sizeof(*windows),
@@ -518,6 +515,12 @@ static const struct of_device_id sh_pfc_of_table[] = {
 		.data = &r8a774a1_pinmux_info,
 	},
 #endif
+#ifdef CONFIG_PINCTRL_PFC_R8A774B1
+	{
+		.compatible = "renesas,pfc-r8a774b1",
+		.data = &r8a774b1_pinmux_info,
+	},
+#endif
 #ifdef CONFIG_PINCTRL_PFC_R8A774C0
 	{
 		.compatible = "renesas,pfc-r8a774c0",
@@ -566,23 +569,29 @@ static const struct of_device_id sh_pfc_of_table[] = {
 		.data = &r8a7794_pinmux_info,
 	},
 #endif
-#ifdef CONFIG_PINCTRL_PFC_R8A7795
+/* Both r8a7795 entries must be present to make sanity checks work */
+#ifdef CONFIG_PINCTRL_PFC_R8A77950
 	{
 		.compatible = "renesas,pfc-r8a7795",
-		.data = &r8a7795_pinmux_info,
+		.data = &r8a77950_pinmux_info,
 	},
-#ifdef DEBUG
-	{
-		/* For sanity checks only (nothing matches against this) */
-		.compatible = "renesas,pfc-r8a77950",	/* R-Car H3 ES1.0 */
-		.data = &r8a7795es1_pinmux_info,
-	},
-#endif /* DEBUG */
 #endif
-#ifdef CONFIG_PINCTRL_PFC_R8A7796
+#ifdef CONFIG_PINCTRL_PFC_R8A77951
+	{
+		.compatible = "renesas,pfc-r8a7795",
+		.data = &r8a77951_pinmux_info,
+	},
+#endif
+#ifdef CONFIG_PINCTRL_PFC_R8A77960
 	{
 		.compatible = "renesas,pfc-r8a7796",
-		.data = &r8a7796_pinmux_info,
+		.data = &r8a77960_pinmux_info,
+	},
+#endif
+#ifdef CONFIG_PINCTRL_PFC_R8A77961
+	{
+		.compatible = "renesas,pfc-r8a77961",
+		.data = &r8a77961_pinmux_info,
 	},
 #endif
 #ifdef CONFIG_PINCTRL_PFC_R8A77965
@@ -717,7 +726,7 @@ static int sh_pfc_suspend_init(struct sh_pfc *pfc) { return 0; }
 #endif /* CONFIG_PM_SLEEP && CONFIG_ARM_PSCI_FW */
 
 #ifdef DEBUG
-static bool is0s(const u16 *enum_ids, unsigned int n)
+static bool __init is0s(const u16 *enum_ids, unsigned int n)
 {
 	unsigned int i;
 
@@ -728,11 +737,11 @@ static bool is0s(const u16 *enum_ids, unsigned int n)
 	return true;
 }
 
-static unsigned int sh_pfc_errors;
-static unsigned int sh_pfc_warnings;
+static unsigned int sh_pfc_errors __initdata = 0;
+static unsigned int sh_pfc_warnings __initdata = 0;
 
-static void sh_pfc_check_cfg_reg(const char *drvname,
-				 const struct pinmux_cfg_reg *cfg_reg)
+static void __init sh_pfc_check_cfg_reg(const char *drvname,
+					const struct pinmux_cfg_reg *cfg_reg)
 {
 	unsigned int i, n, rw, fw;
 
@@ -764,7 +773,7 @@ static void sh_pfc_check_cfg_reg(const char *drvname,
 	}
 }
 
-static void sh_pfc_check_info(const struct sh_pfc_soc_info *info)
+static void __init sh_pfc_check_info(const struct sh_pfc_soc_info *info)
 {
 	const struct sh_pfc_function *func;
 	const char *drvname = info->name;
@@ -773,6 +782,35 @@ static void sh_pfc_check_info(const struct sh_pfc_soc_info *info)
 
 	pr_info("Checking %s\n", drvname);
 
+	/* Check pins */
+	for (i = 0; i < info->nr_pins; i++) {
+		for (j = 0; j < i; j++) {
+			if (!strcmp(info->pins[i].name, info->pins[j].name)) {
+				pr_err("%s: pin %s/%s: name conflict\n",
+				       drvname, info->pins[i].name,
+				       info->pins[j].name);
+				sh_pfc_errors++;
+			}
+
+			if (info->pins[i].pin != (u16)-1 &&
+			    info->pins[i].pin == info->pins[j].pin) {
+				pr_err("%s: pin %s/%s: pin %u conflict\n",
+				       drvname, info->pins[i].name,
+				       info->pins[j].name, info->pins[i].pin);
+				sh_pfc_errors++;
+			}
+
+			if (info->pins[i].enum_id &&
+			    info->pins[i].enum_id == info->pins[j].enum_id) {
+				pr_err("%s: pin %s/%s: enum_id %u conflict\n",
+				       drvname, info->pins[i].name,
+				       info->pins[j].name,
+				       info->pins[i].enum_id);
+				sh_pfc_errors++;
+			}
+		}
+	}
+
 	/* Check groups and functions */
 	refcnts = kcalloc(info->nr_groups, sizeof(*refcnts), GFP_KERNEL);
 	if (!refcnts)
@@ -780,9 +818,15 @@ static void sh_pfc_check_info(const struct sh_pfc_soc_info *info)
 
 	for (i = 0; i < info->nr_functions; i++) {
 		func = &info->functions[i];
+		if (!func->name) {
+			pr_err("%s: empty function %u\n", drvname, i);
+			sh_pfc_errors++;
+			continue;
+		}
 		for (j = 0; j < func->nr_groups; j++) {
 			for (k = 0; k < info->nr_groups; k++) {
-				if (!strcmp(func->groups[j],
+				if (info->groups[k].name &&
+				    !strcmp(func->groups[j],
 					    info->groups[k].name)) {
 					refcnts[k]++;
 					break;
@@ -798,13 +842,18 @@ static void sh_pfc_check_info(const struct sh_pfc_soc_info *info)
 	}
 
 	for (i = 0; i < info->nr_groups; i++) {
+		if (!info->groups[i].name) {
+			pr_err("%s: empty group %u\n", drvname, i);
+			sh_pfc_errors++;
+			continue;
+		}
 		if (!refcnts[i]) {
 			pr_err("%s: orphan group %s\n", drvname,
 			       info->groups[i].name);
 			sh_pfc_errors++;
 		} else if (refcnts[i] > 1) {
-			pr_err("%s: group %s referred by %u functions\n",
-			       drvname, info->groups[i].name, refcnts[i]);
+			pr_warn("%s: group %s referenced by %u functions\n",
+				drvname, info->groups[i].name, refcnts[i]);
 			sh_pfc_warnings++;
 		}
 	}
@@ -816,7 +865,7 @@ static void sh_pfc_check_info(const struct sh_pfc_soc_info *info)
 		sh_pfc_check_cfg_reg(drvname, &info->cfg_regs[i]);
 }
 
-static void sh_pfc_check_driver(const struct platform_driver *pdrv)
+static void __init sh_pfc_check_driver(const struct platform_driver *pdrv)
 {
 	unsigned int i;
 
@@ -838,19 +887,49 @@ static void sh_pfc_check_driver(const struct platform_driver *pdrv)
 static inline void sh_pfc_check_driver(struct platform_driver *pdrv) {}
 #endif /* !DEBUG */
 
+#ifdef CONFIG_OF
+static const void *sh_pfc_quirk_match(void)
+{
+#if defined(CONFIG_PINCTRL_PFC_R8A77950) || \
+    defined(CONFIG_PINCTRL_PFC_R8A77951)
+	const struct soc_device_attribute *match;
+	static const struct soc_device_attribute quirks[] = {
+		{
+			.soc_id = "r8a7795", .revision = "ES1.*",
+			.data = &r8a77950_pinmux_info,
+		},
+		{
+			.soc_id = "r8a7795",
+			.data = &r8a77951_pinmux_info,
+		},
+
+		{ /* sentinel */ }
+	};
+
+	match = soc_device_match(quirks);
+	if (match)
+		return match->data ?: ERR_PTR(-ENODEV);
+#endif /* CONFIG_PINCTRL_PFC_R8A77950 || CONFIG_PINCTRL_PFC_R8A77951 */
+
+	return NULL;
+}
+#endif /* CONFIG_OF */
+
 static int sh_pfc_probe(struct platform_device *pdev)
 {
-#ifdef CONFIG_OF
-	struct device_node *np = pdev->dev.of_node;
-#endif
 	const struct sh_pfc_soc_info *info;
 	struct sh_pfc *pfc;
 	int ret;
 
 #ifdef CONFIG_OF
-	if (np)
-		info = of_device_get_match_data(&pdev->dev);
-	else
+	if (pdev->dev.of_node) {
+		info = sh_pfc_quirk_match();
+		if (IS_ERR(info))
+			return PTR_ERR(info);
+
+		if (!info)
+			info = of_device_get_match_data(&pdev->dev);
+	} else
 #endif
 		info = (const void *)platform_get_device_id(pdev)->driver_data;
 

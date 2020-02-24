@@ -1,16 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /* drivers/gpu/drm/exynos5433_drm_decon.c
  *
  * Copyright (C) 2015 Samsung Electronics Co.Ltd
  * Authors:
  *	Joonyoung Shim <jy0922.shim@samsung.com>
  *	Hyungwon Hwang <human.hwang@samsung.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundationr
  */
 
-#include <linux/platform_device.h>
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/iopoll.h>
@@ -18,11 +14,15 @@
 #include <linux/mfd/syscon.h>
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 
-#include "exynos_drm_drv.h"
+#include <drm/drm_fourcc.h>
+#include <drm/drm_vblank.h>
+
 #include "exynos_drm_crtc.h"
+#include "exynos_drm_drv.h"
 #include "exynos_drm_fb.h"
 #include "exynos_drm_plane.h"
 #include "regs-decon5433.h"
@@ -510,7 +510,7 @@ static void decon_swreset(struct decon_context *ctx)
 	       ctx->addr + DECON_CRCCTRL);
 }
 
-static void decon_enable(struct exynos_drm_crtc *crtc)
+static void decon_atomic_enable(struct exynos_drm_crtc *crtc)
 {
 	struct decon_context *ctx = crtc->ctx;
 
@@ -523,7 +523,7 @@ static void decon_enable(struct exynos_drm_crtc *crtc)
 	decon_commit(ctx->crtc);
 }
 
-static void decon_disable(struct exynos_drm_crtc *crtc)
+static void decon_atomic_disable(struct exynos_drm_crtc *crtc)
 {
 	struct decon_context *ctx = crtc->ctx;
 	int i;
@@ -599,8 +599,8 @@ static enum drm_mode_status decon_mode_valid(struct exynos_drm_crtc *crtc,
 }
 
 static const struct exynos_drm_crtc_ops decon_crtc_ops = {
-	.enable			= decon_enable,
-	.disable		= decon_disable,
+	.atomic_enable		= decon_atomic_enable,
+	.atomic_disable		= decon_atomic_disable,
 	.enable_vblank		= decon_enable_vblank,
 	.disable_vblank		= decon_disable_vblank,
 	.atomic_begin		= decon_atomic_begin,
@@ -651,7 +651,7 @@ static void decon_unbind(struct device *dev, struct device *master, void *data)
 {
 	struct decon_context *ctx = dev_get_drvdata(dev);
 
-	decon_disable(ctx->crtc);
+	decon_atomic_disable(ctx->crtc);
 
 	/* detach this sub driver from iommu mapping if supported. */
 	exynos_drm_unregister_dma(ctx->drm_dev, ctx->dev);

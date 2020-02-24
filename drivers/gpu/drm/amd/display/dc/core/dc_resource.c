@@ -22,6 +22,9 @@
  * Authors: AMD
  *
  */
+
+#include <linux/slab.h>
+
 #include "dm_services.h"
 
 #include "resource.h"
@@ -43,9 +46,11 @@
 #include "dce100/dce100_resource.h"
 #include "dce110/dce110_resource.h"
 #include "dce112/dce112_resource.h"
-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+#if defined(CONFIG_DRM_AMD_DC_DCN)
 #include "dcn10/dcn10_resource.h"
 #endif
+#include "dcn20/dcn20_resource.h"
+#include "dcn21/dcn21_resource.h"
 #include "dce120/dce120_resource.h"
 
 #define DC_LOGGER_INIT(logger)
@@ -90,15 +95,19 @@ enum dce_version resource_parse_asic_id(struct hw_asic_id asic_id)
 		else
 			dc_version = DCE_VERSION_12_0;
 		break;
-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+#if defined(CONFIG_DRM_AMD_DC_DCN)
 	case FAMILY_RV:
 		dc_version = DCN_VERSION_1_0;
-#if defined(CONFIG_DRM_AMD_DC_DCN1_01)
 		if (ASICREV_IS_RAVEN2(asic_id.hw_internal_rev))
 			dc_version = DCN_VERSION_1_01;
-#endif
+		if (ASICREV_IS_RENOIR(asic_id.hw_internal_rev))
+			dc_version = DCN_VERSION_2_1;
 		break;
 #endif
+
+	case FAMILY_NV:
+		dc_version = DCN_VERSION_2_0;
+		break;
 	default:
 		dc_version = DCE_VERSION_UNKNOWN;
 		break;
@@ -145,48 +154,41 @@ struct resource_pool *dc_create_resource_pool(struct dc  *dc,
 				init_data->num_virtual_links, dc);
 		break;
 
-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+#if defined(CONFIG_DRM_AMD_DC_DCN)
 	case DCN_VERSION_1_0:
-#if defined(CONFIG_DRM_AMD_DC_DCN1_01)
 	case DCN_VERSION_1_01:
-#endif
 		res_pool = dcn10_create_resource_pool(init_data, dc);
 		break;
-#endif
 
+
+	case DCN_VERSION_2_0:
+		res_pool = dcn20_create_resource_pool(init_data, dc);
+		break;
+	case DCN_VERSION_2_1:
+		res_pool = dcn21_create_resource_pool(init_data, dc);
+		break;
+#endif
 
 	default:
 		break;
 	}
+
 	if (res_pool != NULL) {
-		struct dc_firmware_info fw_info = { { 0 } };
-
-		if (dc->ctx->dc_bios->funcs->get_firmware_info(
-				dc->ctx->dc_bios, &fw_info) == BP_RESULT_OK) {
-				res_pool->ref_clocks.xtalin_clock_inKhz = fw_info.pll_info.crystal_frequency;
-
-				if (IS_FPGA_MAXIMUS_DC(dc->ctx->dce_environment)) {
-					// On FPGA these dividers are currently not configured by GDB
-					res_pool->ref_clocks.dccg_ref_clock_inKhz = res_pool->ref_clocks.xtalin_clock_inKhz;
-					res_pool->ref_clocks.dchub_ref_clock_inKhz = res_pool->ref_clocks.xtalin_clock_inKhz;
-				} else if (res_pool->dccg && res_pool->hubbub) {
-					// If DCCG reference frequency cannot be determined (usually means not set to xtalin) then this is a critical error
-					// as this value must be known for DCHUB programming
-					(res_pool->dccg->funcs->get_dccg_ref_freq)(res_pool->dccg,
-							fw_info.pll_info.crystal_frequency,
-							&res_pool->ref_clocks.dccg_ref_clock_inKhz);
-
-					// Similarly, if DCHUB reference frequency cannot be determined, then it is also a critical error
-					(res_pool->hubbub->funcs->get_dchub_ref_freq)(res_pool->hubbub,
-							res_pool->ref_clocks.dccg_ref_clock_inKhz,
-							&res_pool->ref_clocks.dchub_ref_clock_inKhz);
-				} else {
-					// Not all ASICs have DCCG sw component
-					res_pool->ref_clocks.dccg_ref_clock_inKhz = res_pool->ref_clocks.xtalin_clock_inKhz;
-					res_pool->ref_clocks.dchub_ref_clock_inKhz = res_pool->ref_clocks.xtalin_clock_inKhz;
-				}
-			} else
-				ASSERT_CRITICAL(false);
+		if (dc->ctx->dc_bios->fw_info_valid) {
+			res_pool->ref_clocks.xtalin_clock_inKhz =
+				dc->ctx->dc_bios->fw_info.pll_info.crystal_frequency;
+			/* initialize with firmware data first, no all
+			 * ASIC have DCCG SW component. FPGA or
+			 * simulation need initialization of
+			 * dccg_ref_clock_inKhz, dchub_ref_clock_inKhz
+			 * with xtalin_clock_inKhz
+			 */
+			res_pool->ref_clocks.dccg_ref_clock_inKhz =
+				res_pool->ref_clocks.xtalin_clock_inKhz;
+			res_pool->ref_clocks.dchub_ref_clock_inKhz =
+				res_pool->ref_clocks.xtalin_clock_inKhz;
+		} else
+			ASSERT_CRITICAL(false);
 	}
 
 	return res_pool;
@@ -254,19 +256,17 @@ bool resource_construct(
 		 * PORT_CONNECTIVITY == 1 (as instructed by HW team).
 		 */
 		update_num_audio(&straps, &num_audio, &pool->audio_support);
-		for (i = 0; i < pool->pipe_count && i < num_audio; i++) {
+		for (i = 0; i < caps->num_audio; i++) {
 			struct audio *aud = create_funcs->create_audio(ctx, i);
 
 			if (aud == NULL) {
 				DC_ERR("DC: failed to create audio!\n");
 				return false;
 			}
-
 			if (!aud->funcs->endpoint_valid(aud)) {
 				aud->funcs->destroy(&aud);
 				break;
 			}
-
 			pool->audios[i] = aud;
 			pool->audio_count++;
 		}
@@ -390,6 +390,9 @@ bool resource_are_streams_timing_synchronizable(
 		return false;
 
 	if (stream1->view_format != stream2->view_format)
+		return false;
+
+	if (stream1->ignore_msa_timing_param || stream2->ignore_msa_timing_param)
 		return false;
 
 	return true;
@@ -937,11 +940,51 @@ static void calculate_inits_and_adj_vp(struct pipe_ctx *pipe_ctx)
 
 }
 
+/*
+ * When handling 270 rotation in mixed SLS mode, we have
+ * stream->timing.h_border_left that is non zero.  If we are doing
+ * pipe-splitting, this h_border_left value gets added to recout.x and when it
+ * calls calculate_inits_and_adj_vp() and
+ * adjust_vp_and_init_for_seamless_clip(), it can cause viewport.height for a
+ * pipe to be incorrect.
+ *
+ * To fix this, instead of using stream->timing.h_border_left, we can use
+ * stream->dst.x to represent the border instead.  So we will set h_border_left
+ * to 0 and shift the appropriate amount in stream->dst.x.  We will then
+ * perform all calculations in resource_build_scaling_params() based on this
+ * and then restore the h_border_left and stream->dst.x to their original
+ * values.
+ *
+ * shift_border_left_to_dst() will shift the amount of h_border_left to
+ * stream->dst.x and set h_border_left to 0.  restore_border_left_from_dst()
+ * will restore h_border_left and stream->dst.x back to their original values
+ * We also need to make sure pipe_ctx->plane_res.scl_data.h_active uses the
+ * original h_border_left value in its calculation.
+ */
+int shift_border_left_to_dst(struct pipe_ctx *pipe_ctx)
+{
+	int store_h_border_left = pipe_ctx->stream->timing.h_border_left;
+
+	if (store_h_border_left) {
+		pipe_ctx->stream->timing.h_border_left = 0;
+		pipe_ctx->stream->dst.x += store_h_border_left;
+	}
+	return store_h_border_left;
+}
+
+void restore_border_left_from_dst(struct pipe_ctx *pipe_ctx,
+                                  int store_h_border_left)
+{
+	pipe_ctx->stream->dst.x -= store_h_border_left;
+	pipe_ctx->stream->timing.h_border_left = store_h_border_left;
+}
+
 bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx)
 {
 	const struct dc_plane_state *plane_state = pipe_ctx->plane_state;
 	struct dc_crtc_timing *timing = &pipe_ctx->stream->timing;
 	bool res = false;
+	int store_h_border_left = shift_border_left_to_dst(pipe_ctx);
 	DC_LOGGER_INIT(pipe_ctx->stream->ctx->logger);
 	/* Important: scaling ratio calculation requires pixel format,
 	 * lb depth calculation requires recout and taps require scaling ratios.
@@ -954,8 +997,14 @@ bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx)
 
 	calculate_viewport(pipe_ctx);
 
-	if (pipe_ctx->plane_res.scl_data.viewport.height < 16 || pipe_ctx->plane_res.scl_data.viewport.width < 16)
+	if (pipe_ctx->plane_res.scl_data.viewport.height < 16 ||
+		pipe_ctx->plane_res.scl_data.viewport.width < 16) {
+		if (store_h_border_left) {
+			restore_border_left_from_dst(pipe_ctx,
+				store_h_border_left);
+		}
 		return false;
+	}
 
 	calculate_recout(pipe_ctx);
 
@@ -968,8 +1017,10 @@ bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx)
 	pipe_ctx->plane_res.scl_data.recout.x += timing->h_border_left;
 	pipe_ctx->plane_res.scl_data.recout.y += timing->v_border_top;
 
-	pipe_ctx->plane_res.scl_data.h_active = timing->h_addressable + timing->h_border_left + timing->h_border_right;
-	pipe_ctx->plane_res.scl_data.v_active = timing->v_addressable + timing->v_border_top + timing->v_border_bottom;
+	pipe_ctx->plane_res.scl_data.h_active = timing->h_addressable +
+		store_h_border_left + timing->h_border_right;
+	pipe_ctx->plane_res.scl_data.v_active = timing->v_addressable +
+		timing->v_border_top + timing->v_border_bottom;
 
 	/* Taps calculations */
 	if (pipe_ctx->plane_res.xfm != NULL)
@@ -979,6 +1030,8 @@ bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx)
 	if (pipe_ctx->plane_res.dpp != NULL)
 		res = pipe_ctx->plane_res.dpp->funcs->dpp_get_optimal_number_of_taps(
 				pipe_ctx->plane_res.dpp, &pipe_ctx->plane_res.scl_data, &plane_state->scaling_quality);
+
+
 	if (!res) {
 		/* Try 24 bpp linebuffer */
 		pipe_ctx->plane_res.scl_data.lb_params.depth = LB_PIXEL_DEPTH_24BPP;
@@ -1013,6 +1066,9 @@ bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx)
 				plane_state->dst_rect.width,
 				plane_state->dst_rect.x,
 				plane_state->dst_rect.y);
+
+	if (store_h_border_left)
+		restore_border_left_from_dst(pipe_ctx, store_h_border_left);
 
 	return res;
 }
@@ -1099,25 +1155,21 @@ struct pipe_ctx *resource_get_head_pipe_for_stream(
 		struct dc_stream_state *stream)
 {
 	int i;
+
 	for (i = 0; i < MAX_PIPES; i++) {
-		if (res_ctx->pipe_ctx[i].stream == stream &&
-				!res_ctx->pipe_ctx[i].top_pipe) {
+		if (res_ctx->pipe_ctx[i].stream == stream
+				&& !res_ctx->pipe_ctx[i].top_pipe
+				&& !res_ctx->pipe_ctx[i].prev_odm_pipe)
 			return &res_ctx->pipe_ctx[i];
-			break;
-		}
 	}
 	return NULL;
 }
 
-static struct pipe_ctx *resource_get_tail_pipe_for_stream(
+static struct pipe_ctx *resource_get_tail_pipe(
 		struct resource_context *res_ctx,
-		struct dc_stream_state *stream)
+		struct pipe_ctx *head_pipe)
 {
-	struct pipe_ctx *head_pipe, *tail_pipe;
-	head_pipe = resource_get_head_pipe_for_stream(res_ctx, stream);
-
-	if (!head_pipe)
-		return NULL;
+	struct pipe_ctx *tail_pipe;
 
 	tail_pipe = head_pipe->bottom_pipe;
 
@@ -1133,31 +1185,20 @@ static struct pipe_ctx *resource_get_tail_pipe_for_stream(
  * A free_pipe for a stream is defined here as a pipe
  * that has no surface attached yet
  */
-static struct pipe_ctx *acquire_free_pipe_for_stream(
+static struct pipe_ctx *acquire_free_pipe_for_head(
 		struct dc_state *context,
 		const struct resource_pool *pool,
-		struct dc_stream_state *stream)
+		struct pipe_ctx *head_pipe)
 {
 	int i;
 	struct resource_context *res_ctx = &context->res_ctx;
-
-	struct pipe_ctx *head_pipe = NULL;
-
-	/* Find head pipe, which has the back end set up*/
-
-	head_pipe = resource_get_head_pipe_for_stream(res_ctx, stream);
-
-	if (!head_pipe) {
-		ASSERT(0);
-		return NULL;
-	}
 
 	if (!head_pipe->plane_state)
 		return head_pipe;
 
 	/* Re-use pipe already acquired for this stream if available*/
 	for (i = pool->pipe_count - 1; i >= 0; i--) {
-		if (res_ctx->pipe_ctx[i].stream == stream &&
+		if (res_ctx->pipe_ctx[i].stream == head_pipe->stream &&
 				!res_ctx->pipe_ctx[i].plane_state) {
 			return &res_ctx->pipe_ctx[i];
 		}
@@ -1171,11 +1212,10 @@ static struct pipe_ctx *acquire_free_pipe_for_stream(
 	if (!pool->funcs->acquire_idle_pipe_for_layer)
 		return NULL;
 
-	return pool->funcs->acquire_idle_pipe_for_layer(context, pool, stream);
-
+	return pool->funcs->acquire_idle_pipe_for_layer(context, pool, head_pipe->stream);
 }
 
-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
+#if defined(CONFIG_DRM_AMD_DC_DCN)
 static int acquire_first_split_pipe(
 		struct resource_context *res_ctx,
 		const struct resource_pool *pool,
@@ -1184,24 +1224,27 @@ static int acquire_first_split_pipe(
 	int i;
 
 	for (i = 0; i < pool->pipe_count; i++) {
-		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[i];
+		struct pipe_ctx *split_pipe = &res_ctx->pipe_ctx[i];
 
-		if (pipe_ctx->top_pipe &&
-				pipe_ctx->top_pipe->plane_state == pipe_ctx->plane_state) {
-			pipe_ctx->top_pipe->bottom_pipe = pipe_ctx->bottom_pipe;
-			if (pipe_ctx->bottom_pipe)
-				pipe_ctx->bottom_pipe->top_pipe = pipe_ctx->top_pipe;
+		if (split_pipe->top_pipe &&
+				split_pipe->top_pipe->plane_state == split_pipe->plane_state) {
+			split_pipe->top_pipe->bottom_pipe = split_pipe->bottom_pipe;
+			if (split_pipe->bottom_pipe)
+				split_pipe->bottom_pipe->top_pipe = split_pipe->top_pipe;
 
-			memset(pipe_ctx, 0, sizeof(*pipe_ctx));
-			pipe_ctx->stream_res.tg = pool->timing_generators[i];
-			pipe_ctx->plane_res.hubp = pool->hubps[i];
-			pipe_ctx->plane_res.ipp = pool->ipps[i];
-			pipe_ctx->plane_res.dpp = pool->dpps[i];
-			pipe_ctx->stream_res.opp = pool->opps[i];
-			pipe_ctx->plane_res.mpcc_inst = pool->dpps[i]->inst;
-			pipe_ctx->pipe_idx = i;
+			if (split_pipe->top_pipe->plane_state)
+				resource_build_scaling_params(split_pipe->top_pipe);
 
-			pipe_ctx->stream = stream;
+			memset(split_pipe, 0, sizeof(*split_pipe));
+			split_pipe->stream_res.tg = pool->timing_generators[i];
+			split_pipe->plane_res.hubp = pool->hubps[i];
+			split_pipe->plane_res.ipp = pool->ipps[i];
+			split_pipe->plane_res.dpp = pool->dpps[i];
+			split_pipe->stream_res.opp = pool->opps[i];
+			split_pipe->plane_res.mpcc_inst = pool->dpps[i]->inst;
+			split_pipe->pipe_idx = i;
+
+			split_pipe->stream = stream;
 			return i;
 		}
 	}
@@ -1244,72 +1287,45 @@ bool dc_add_plane_to_context(
 		return false;
 	}
 
-	tail_pipe = resource_get_tail_pipe_for_stream(&context->res_ctx, stream);
-	ASSERT(tail_pipe);
-
-	free_pipe = acquire_free_pipe_for_stream(context, pool, stream);
-
-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
-	if (!free_pipe) {
-		int pipe_idx = acquire_first_split_pipe(&context->res_ctx, pool, stream);
-		if (pipe_idx >= 0)
-			free_pipe = &context->res_ctx.pipe_ctx[pipe_idx];
-	}
-#endif
-	if (!free_pipe)
-		return false;
-
-	/* retain new surfaces */
+	/* retain new surface, but only once per stream */
 	dc_plane_state_retain(plane_state);
-	free_pipe->plane_state = plane_state;
 
-	if (head_pipe != free_pipe) {
-		free_pipe->stream_res.tg = tail_pipe->stream_res.tg;
-		free_pipe->stream_res.abm = tail_pipe->stream_res.abm;
-		free_pipe->stream_res.opp = tail_pipe->stream_res.opp;
-		free_pipe->stream_res.stream_enc = tail_pipe->stream_res.stream_enc;
-		free_pipe->stream_res.audio = tail_pipe->stream_res.audio;
-		free_pipe->clock_source = tail_pipe->clock_source;
-		free_pipe->top_pipe = tail_pipe;
-		tail_pipe->bottom_pipe = free_pipe;
-	} else if (free_pipe->bottom_pipe && free_pipe->bottom_pipe->plane_state == NULL) {
-		ASSERT(free_pipe->bottom_pipe->stream_res.opp != free_pipe->stream_res.opp);
-		free_pipe->bottom_pipe->plane_state = plane_state;
+	while (head_pipe) {
+		tail_pipe = resource_get_tail_pipe(&context->res_ctx, head_pipe);
+		ASSERT(tail_pipe);
+
+		free_pipe = acquire_free_pipe_for_head(context, pool, head_pipe);
+
+	#if defined(CONFIG_DRM_AMD_DC_DCN)
+		if (!free_pipe) {
+			int pipe_idx = acquire_first_split_pipe(&context->res_ctx, pool, stream);
+			if (pipe_idx >= 0)
+				free_pipe = &context->res_ctx.pipe_ctx[pipe_idx];
+		}
+	#endif
+		if (!free_pipe) {
+			dc_plane_state_release(plane_state);
+			return false;
+		}
+
+		free_pipe->plane_state = plane_state;
+
+		if (head_pipe != free_pipe) {
+			free_pipe->stream_res.tg = tail_pipe->stream_res.tg;
+			free_pipe->stream_res.abm = tail_pipe->stream_res.abm;
+			free_pipe->stream_res.opp = tail_pipe->stream_res.opp;
+			free_pipe->stream_res.stream_enc = tail_pipe->stream_res.stream_enc;
+			free_pipe->stream_res.audio = tail_pipe->stream_res.audio;
+			free_pipe->clock_source = tail_pipe->clock_source;
+			free_pipe->top_pipe = tail_pipe;
+			tail_pipe->bottom_pipe = free_pipe;
+		}
+		head_pipe = head_pipe->next_odm_pipe;
 	}
-
 	/* assign new surfaces*/
 	stream_status->plane_states[stream_status->plane_count] = plane_state;
 
 	stream_status->plane_count++;
-
-	return true;
-}
-
-struct pipe_ctx *dc_res_get_odm_bottom_pipe(struct pipe_ctx *pipe_ctx)
-{
-	struct pipe_ctx *bottom_pipe = pipe_ctx->bottom_pipe;
-
-	/* ODM should only be updated once per otg */
-	if (pipe_ctx->top_pipe)
-		return NULL;
-
-	while (bottom_pipe) {
-		if (bottom_pipe->stream_res.opp != pipe_ctx->stream_res.opp)
-			break;
-		bottom_pipe = bottom_pipe->bottom_pipe;
-	}
-
-	return bottom_pipe;
-}
-
-bool dc_res_is_odm_head_pipe(struct pipe_ctx *pipe_ctx)
-{
-	struct pipe_ctx *top_pipe = pipe_ctx->top_pipe;
-
-	if (!top_pipe)
-		return false;
-	if (top_pipe && top_pipe->stream_res.opp == pipe_ctx->stream_res.opp)
-		return false;
 
 	return true;
 }
@@ -1340,12 +1356,6 @@ bool dc_remove_plane_from_context(
 		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
 
 		if (pipe_ctx->plane_state == plane_state) {
-			if (dc_res_is_odm_head_pipe(pipe_ctx)) {
-				pipe_ctx->plane_state = NULL;
-				pipe_ctx->bottom_pipe = NULL;
-				continue;
-			}
-
 			if (pipe_ctx->top_pipe)
 				pipe_ctx->top_pipe->bottom_pipe = pipe_ctx->bottom_pipe;
 
@@ -1360,13 +1370,10 @@ bool dc_remove_plane_from_context(
 			 * For head pipe detach surfaces from pipe for tail
 			 * pipe just zero it out
 			 */
-			if (!pipe_ctx->top_pipe) {
+			if (!pipe_ctx->top_pipe)
 				pipe_ctx->plane_state = NULL;
-				if (!dc_res_get_odm_bottom_pipe(pipe_ctx))
-					pipe_ctx->bottom_pipe = NULL;
-			} else {
+			else
 				memset(pipe_ctx, 0, sizeof(*pipe_ctx));
-			}
 		}
 	}
 
@@ -1561,6 +1568,9 @@ bool dc_is_stream_unchanged(
 	if (!are_stream_backends_same(old_stream, stream))
 		return false;
 
+	if (old_stream->ignore_msa_timing_param != stream->ignore_msa_timing_param)
+		return false;
+
 	return true;
 }
 
@@ -1647,63 +1657,31 @@ static int acquire_first_free_pipe(
 	return -1;
 }
 
-static struct stream_encoder *find_first_free_match_stream_enc_for_link(
-		struct resource_context *res_ctx,
-		const struct resource_pool *pool,
-		struct dc_stream_state *stream)
-{
-	int i;
-	int j = -1;
-	struct dc_link *link = stream->link;
-
-	for (i = 0; i < pool->stream_enc_count; i++) {
-		if (!res_ctx->is_stream_enc_acquired[i] &&
-				pool->stream_enc[i]) {
-			/* Store first available for MST second display
-			 * in daisy chain use case */
-			j = i;
-			if (pool->stream_enc[i]->id ==
-					link->link_enc->preferred_engine)
-				return pool->stream_enc[i];
-		}
-	}
-
-	/*
-	 * below can happen in cases when stream encoder is acquired:
-	 * 1) for second MST display in chain, so preferred engine already
-	 * acquired;
-	 * 2) for another link, which preferred engine already acquired by any
-	 * MST configuration.
-	 *
-	 * If signal is of DP type and preferred engine not found, return last available
-	 *
-	 * TODO - This is just a patch up and a generic solution is
-	 * required for non DP connectors.
-	 */
-
-	if (j >= 0 && link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT)
-		return pool->stream_enc[j];
-
-	return NULL;
-}
-
 static struct audio *find_first_free_audio(
 		struct resource_context *res_ctx,
 		const struct resource_pool *pool,
-		enum engine_id id)
+		enum engine_id id,
+		enum dce_version dc_version)
 {
-	int i;
-	for (i = 0; i < pool->audio_count; i++) {
+	int i, available_audio_count;
+
+	available_audio_count = pool->audio_count;
+
+	for (i = 0; i < available_audio_count; i++) {
 		if ((res_ctx->is_audio_acquired[i] == false) && (res_ctx->is_stream_enc_acquired[i] == true)) {
 			/*we have enough audio endpoint, find the matching inst*/
 			if (id != i)
 				continue;
-
 			return pool->audios[i];
 		}
 	}
+
+	/* use engine id to find free audio */
+	if ((id < available_audio_count) && (res_ctx->is_audio_acquired[id] == false)) {
+		return pool->audios[id];
+	}
 	/*not found the matching one, first come first serve*/
-	for (i = 0; i < pool->audio_count; i++) {
+	for (i = 0; i < available_audio_count; i++) {
 		if (res_ctx->is_audio_acquired[i] == false) {
 			return pool->audios[i];
 		}
@@ -1763,50 +1741,45 @@ enum dc_status dc_remove_stream_from_ctx(
 {
 	int i;
 	struct dc_context *dc_ctx = dc->ctx;
-	struct pipe_ctx *del_pipe = NULL;
-
-	/* Release primary pipe */
-	for (i = 0; i < MAX_PIPES; i++) {
-		if (new_ctx->res_ctx.pipe_ctx[i].stream == stream &&
-				!new_ctx->res_ctx.pipe_ctx[i].top_pipe) {
-			struct pipe_ctx *odm_pipe =
-					dc_res_get_odm_bottom_pipe(&new_ctx->res_ctx.pipe_ctx[i]);
-
-			del_pipe = &new_ctx->res_ctx.pipe_ctx[i];
-
-			ASSERT(del_pipe->stream_res.stream_enc);
-			update_stream_engine_usage(
-					&new_ctx->res_ctx,
-						dc->res_pool,
-					del_pipe->stream_res.stream_enc,
-					false);
-
-			if (del_pipe->stream_res.audio)
-				update_audio_usage(
-					&new_ctx->res_ctx,
-					dc->res_pool,
-					del_pipe->stream_res.audio,
-					false);
-
-			resource_unreference_clock_source(&new_ctx->res_ctx,
-							  dc->res_pool,
-							  del_pipe->clock_source);
-
-			if (dc->res_pool->funcs->remove_stream_from_ctx)
-				dc->res_pool->funcs->remove_stream_from_ctx(dc, new_ctx, stream);
-
-			memset(del_pipe, 0, sizeof(*del_pipe));
-			if (odm_pipe)
-				memset(odm_pipe, 0, sizeof(*odm_pipe));
-
-			break;
-		}
-	}
+	struct pipe_ctx *del_pipe = resource_get_head_pipe_for_stream(&new_ctx->res_ctx, stream);
+	struct pipe_ctx *odm_pipe;
 
 	if (!del_pipe) {
 		DC_ERROR("Pipe not found for stream %p !\n", stream);
 		return DC_ERROR_UNEXPECTED;
 	}
+
+	odm_pipe = del_pipe->next_odm_pipe;
+
+	/* Release primary pipe */
+	ASSERT(del_pipe->stream_res.stream_enc);
+	update_stream_engine_usage(
+			&new_ctx->res_ctx,
+				dc->res_pool,
+			del_pipe->stream_res.stream_enc,
+			false);
+
+	if (del_pipe->stream_res.audio)
+		update_audio_usage(
+			&new_ctx->res_ctx,
+			dc->res_pool,
+			del_pipe->stream_res.audio,
+			false);
+
+	resource_unreference_clock_source(&new_ctx->res_ctx,
+					  dc->res_pool,
+					  del_pipe->clock_source);
+
+	if (dc->res_pool->funcs->remove_stream_from_ctx)
+		dc->res_pool->funcs->remove_stream_from_ctx(dc, new_ctx, stream);
+
+	while (odm_pipe) {
+		struct pipe_ctx *next_odm_pipe = odm_pipe->next_odm_pipe;
+
+		memset(odm_pipe, 0, sizeof(*odm_pipe));
+		odm_pipe = next_odm_pipe;
+	}
+	memset(del_pipe, 0, sizeof(*del_pipe));
 
 	for (i = 0; i < new_ctx->stream_count; i++)
 		if (new_ctx->streams[i] == stream)
@@ -1866,6 +1839,7 @@ static int get_norm_pix_clk(const struct dc_crtc_timing *timing)
 		pix_clk /= 2;
 	if (timing->pixel_encoding != PIXEL_ENCODING_YCBCR422) {
 		switch (timing->display_color_depth) {
+		case COLOR_DEPTH_666:
 		case COLOR_DEPTH_888:
 			normalized_pix_clk = pix_clk;
 			break;
@@ -1906,40 +1880,67 @@ static int acquire_resource_from_hw_enabled_state(
 		struct dc_stream_state *stream)
 {
 	struct dc_link *link = stream->link;
-	unsigned int inst;
+	unsigned int i, inst, tg_inst = 0;
 
 	/* Check for enabled DIG to identify enabled display */
 	if (!link->link_enc->funcs->is_dig_enabled(link->link_enc))
 		return -1;
 
-	/* Check for which front end is used by this encoder.
-	 * Note the inst is 1 indexed, where 0 is undefined.
-	 * Note that DIG_FE can source from different OTG but our
-	 * current implementation always map 1-to-1, so this code makes
-	 * the same assumption and doesn't check OTG source.
-	 */
-	inst = link->link_enc->funcs->get_dig_frontend(link->link_enc) - 1;
+	inst = link->link_enc->funcs->get_dig_frontend(link->link_enc);
 
-	/* Instance should be within the range of the pool */
-	if (inst >= pool->pipe_count)
+	if (inst == ENGINE_ID_UNKNOWN)
 		return -1;
 
-	if (!res_ctx->pipe_ctx[inst].stream) {
-		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[inst];
+	for (i = 0; i < pool->stream_enc_count; i++) {
+		if (pool->stream_enc[i]->id == inst) {
+			tg_inst = pool->stream_enc[i]->funcs->dig_source_otg(
+				pool->stream_enc[i]);
+			break;
+		}
+	}
 
-		pipe_ctx->stream_res.tg = pool->timing_generators[inst];
-		pipe_ctx->plane_res.mi = pool->mis[inst];
-		pipe_ctx->plane_res.hubp = pool->hubps[inst];
-		pipe_ctx->plane_res.ipp = pool->ipps[inst];
-		pipe_ctx->plane_res.xfm = pool->transforms[inst];
-		pipe_ctx->plane_res.dpp = pool->dpps[inst];
-		pipe_ctx->stream_res.opp = pool->opps[inst];
-		if (pool->dpps[inst])
-			pipe_ctx->plane_res.mpcc_inst = pool->dpps[inst]->inst;
-		pipe_ctx->pipe_idx = inst;
+	// tg_inst not found
+	if (i == pool->stream_enc_count)
+		return -1;
+
+	if (tg_inst >= pool->timing_generator_count)
+		return -1;
+
+	if (!res_ctx->pipe_ctx[tg_inst].stream) {
+		struct pipe_ctx *pipe_ctx = &res_ctx->pipe_ctx[tg_inst];
+
+		pipe_ctx->stream_res.tg = pool->timing_generators[tg_inst];
+		pipe_ctx->plane_res.mi = pool->mis[tg_inst];
+		pipe_ctx->plane_res.hubp = pool->hubps[tg_inst];
+		pipe_ctx->plane_res.ipp = pool->ipps[tg_inst];
+		pipe_ctx->plane_res.xfm = pool->transforms[tg_inst];
+		pipe_ctx->plane_res.dpp = pool->dpps[tg_inst];
+		pipe_ctx->stream_res.opp = pool->opps[tg_inst];
+
+		if (pool->dpps[tg_inst]) {
+			pipe_ctx->plane_res.mpcc_inst = pool->dpps[tg_inst]->inst;
+
+			// Read DPP->MPCC->OPP Pipe from HW State
+			if (pool->mpc->funcs->read_mpcc_state) {
+				struct mpcc_state s = {0};
+
+				pool->mpc->funcs->read_mpcc_state(pool->mpc, pipe_ctx->plane_res.mpcc_inst, &s);
+
+				if (s.dpp_id < MAX_MPCC)
+					pool->mpc->mpcc_array[pipe_ctx->plane_res.mpcc_inst].dpp_id = s.dpp_id;
+
+				if (s.bot_mpcc_id < MAX_MPCC)
+					pool->mpc->mpcc_array[pipe_ctx->plane_res.mpcc_inst].mpcc_bot =
+							&pool->mpc->mpcc_array[s.bot_mpcc_id];
+
+				if (s.opp_id < MAX_OPP)
+					pipe_ctx->stream_res.opp->mpc_tree_params.opp_id = s.opp_id;
+			}
+		}
+		pipe_ctx->pipe_idx = tg_inst;
 
 		pipe_ctx->stream = stream;
-		return inst;
+		return tg_inst;
 	}
 
 	return -1;
@@ -1987,7 +1988,7 @@ enum dc_status resource_map_pool_resources(
 		/* acquire new resources */
 		pipe_idx = acquire_first_free_pipe(&context->res_ctx, pool, stream);
 
-#ifdef CONFIG_DRM_AMD_DC_DCN1_0
+#ifdef CONFIG_DRM_AMD_DC_DCN
 	if (pipe_idx < 0)
 		pipe_idx = acquire_first_split_pipe(&context->res_ctx, pool, stream);
 #endif
@@ -1998,7 +1999,7 @@ enum dc_status resource_map_pool_resources(
 	pipe_ctx = &context->res_ctx.pipe_ctx[pipe_idx];
 
 	pipe_ctx->stream_res.stream_enc =
-		find_first_free_match_stream_enc_for_link(
+		dc->res_pool->funcs->find_first_free_match_stream_enc_for_link(
 			&context->res_ctx, pool, stream);
 
 	if (!pipe_ctx->stream_res.stream_enc)
@@ -2012,9 +2013,9 @@ enum dc_status resource_map_pool_resources(
 	/* TODO: Add check if ASIC support and EDID audio */
 	if (!stream->converter_disable_audio &&
 	    dc_is_audio_capable_signal(pipe_ctx->stream->signal) &&
-	    stream->audio_info.mode_count) {
+	    stream->audio_info.mode_count && stream->audio_info.flags.all) {
 		pipe_ctx->stream_res.audio = find_first_free_audio(
-		&context->res_ctx, pool, pipe_ctx->stream_res.stream_enc->id);
+		&context->res_ctx, pool, pipe_ctx->stream_res.stream_enc->id, dc_ctx->dce_version);
 
 		/*
 		 * Audio assigned in order first come first get.
@@ -2034,6 +2035,9 @@ enum dc_status resource_map_pool_resources(
 		if (context->streams[i] == stream) {
 			context->stream_status[i].primary_otg_inst = pipe_ctx->stream_res.tg->inst;
 			context->stream_status[i].stream_enc_inst = pipe_ctx->stream_res.stream_enc->id;
+			context->stream_status[i].audio_inst =
+				pipe_ctx->stream_res.audio ? pipe_ctx->stream_res.audio->inst : -1;
+
 			return DC_OK;
 		}
 
@@ -2059,8 +2063,15 @@ void dc_resource_state_construct(
 		const struct dc *dc,
 		struct dc_state *dst_ctx)
 {
-	dst_ctx->clk_mgr = dc->res_pool->clk_mgr;
+	dst_ctx->clk_mgr = dc->clk_mgr;
 }
+
+
+bool dc_resource_is_dsc_encoding_supported(const struct dc *dc)
+{
+	return dc->res_pool->res_cap->num_dsc > 0;
+}
+
 
 /**
  * dc_validate_global_state() - Determine if HW can support a given state
@@ -2318,7 +2329,7 @@ static void set_avi_info_frame(
 		if (color_space == COLOR_SPACE_SRGB ||
 			color_space == COLOR_SPACE_2020_RGB_FULLRANGE) {
 			hdmi_info.bits.Q0_Q1   = RGB_QUANTIZATION_FULL_RANGE;
-			hdmi_info.bits.YQ0_YQ1 = YYC_QUANTIZATION_FULL_RANGE;
+			hdmi_info.bits.YQ0_YQ1 = YYC_QUANTIZATION_LIMITED_RANGE;
 		} else if (color_space == COLOR_SPACE_SRGB_LIMITED ||
 					color_space == COLOR_SPACE_2020_RGB_LIMITEDRANGE) {
 			hdmi_info.bits.Q0_Q1   = RGB_QUANTIZATION_LIMITED_RANGE;
@@ -2354,7 +2365,18 @@ static void set_avi_info_frame(
 			break;
 		}
 	}
+	/* If VIC >= 128, the Source shall use AVI InfoFrame Version 3*/
 	hdmi_info.bits.VIC0_VIC7 = vic;
+	if (vic >= 128)
+		hdmi_info.bits.header.version = 3;
+	/* If (C1, C0)=(1, 1) and (EC2, EC1, EC0)=(1, 1, 1),
+	 * the Source shall use 20 AVI InfoFrame Version 4
+	 */
+	if (hdmi_info.bits.C0_C1 == COLORIMETRY_EXTENDED &&
+			hdmi_info.bits.EC0_EC2 == COLORIMETRYEX_RESERVED) {
+		hdmi_info.bits.header.version = 4;
+		hdmi_info.bits.header.length = 14;
+	}
 
 	/* pixel repetition
 	 * PR0 - PR3 start from 0 whereas pHwPathMode->mode.timing.flags.pixel
@@ -2373,12 +2395,19 @@ static void set_avi_info_frame(
 	hdmi_info.bits.bar_right = (stream->timing.h_total
 			- stream->timing.h_border_right + 1);
 
+    /* Additional Colorimetry Extension
+     * Used in conduction with C0-C1 and EC0-EC2
+     * 0 = DCI-P3 RGB (D65)
+     * 1 = DCI-P3 RGB (theater)
+     */
+	hdmi_info.bits.ACE0_ACE3 = 0;
+
 	/* check_sum - Calculate AFMT_AVI_INFO0 ~ AFMT_AVI_INFO3 */
 	check_sum = &hdmi_info.packet_raw_data.sb[0];
 
-	*check_sum = HDMI_INFOFRAME_TYPE_AVI + HDMI_AVI_INFOFRAME_SIZE + 2;
+	*check_sum = HDMI_INFOFRAME_TYPE_AVI + hdmi_info.bits.header.length + hdmi_info.bits.header.version;
 
-	for (byte_index = 1; byte_index <= HDMI_AVI_INFOFRAME_SIZE; byte_index++)
+	for (byte_index = 1; byte_index <= hdmi_info.bits.header.length; byte_index++)
 		*check_sum += hdmi_info.packet_raw_data.sb[byte_index];
 
 	/* one byte complement */
@@ -2423,21 +2452,6 @@ static void set_spd_info_packet(
 		return;
 
 	*info_packet = stream->vrr_infopacket;
-}
-
-static void set_dp_sdp_info_packet(
-		struct dc_info_packet *info_packet,
-		struct dc_stream_state *stream)
-{
-	/* SPD info packet for custom sdp message */
-
-	/* Return if false. If true,
-	 * set the corresponding bit in the info packet
-	 */
-	if (!stream->dpsdp_infopacket.valid)
-		return;
-
-	*info_packet = stream->dpsdp_infopacket;
 }
 
 static void set_hdr_static_info_packet(
@@ -2496,6 +2510,11 @@ void dc_resource_state_copy_construct(
 		if (cur_pipe->bottom_pipe)
 			cur_pipe->bottom_pipe = &dst_ctx->res_ctx.pipe_ctx[cur_pipe->bottom_pipe->pipe_idx];
 
+		if (cur_pipe->next_odm_pipe)
+			cur_pipe->next_odm_pipe =  &dst_ctx->res_ctx.pipe_ctx[cur_pipe->next_odm_pipe->pipe_idx];
+
+		if (cur_pipe->prev_odm_pipe)
+			cur_pipe->prev_odm_pipe = &dst_ctx->res_ctx.pipe_ctx[cur_pipe->prev_odm_pipe->pipe_idx];
 	}
 
 	for (i = 0; i < dst_ctx->stream_count; i++) {
@@ -2536,7 +2555,6 @@ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
 	info->spd.valid = false;
 	info->hdrsmd.valid = false;
 	info->vsc.valid = false;
-	info->dpsdp.valid = false;
 
 	signal = pipe_ctx->stream->signal;
 
@@ -2556,8 +2574,6 @@ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
 		set_spd_info_packet(&info->spd, pipe_ctx->stream);
 
 		set_hdr_static_info_packet(&info->hdrsmd, pipe_ctx->stream);
-
-		set_dp_sdp_info_packet(&info->dpsdp, pipe_ctx->stream);
 	}
 
 	patch_gamut_packet_checksum(&info->gamut);
@@ -2642,6 +2658,10 @@ bool pipe_need_reprogram(
 		return true;
 
 	if (is_vsc_info_packet_changed(pipe_ctx_old->stream, pipe_ctx->stream))
+		return true;
+
+	if (false == pipe_ctx_old->stream->link->link_state_valid &&
+		false == pipe_ctx_old->stream->dpms_off)
 		return true;
 
 	return false;
@@ -2775,9 +2795,8 @@ void resource_build_bit_depth_reduction_params(struct dc_stream_state *stream,
 
 enum dc_status dc_validate_stream(struct dc *dc, struct dc_stream_state *stream)
 {
-	struct dc  *core_dc = dc;
 	struct dc_link *link = stream->link;
-	struct timing_generator *tg = core_dc->res_pool->timing_generators[0];
+	struct timing_generator *tg = dc->res_pool->timing_generators[0];
 	enum dc_status res = DC_OK;
 
 	calculate_phy_pix_clks(stream);
@@ -2840,3 +2859,48 @@ unsigned int resource_pixel_format_to_bpp(enum surface_pixel_format format)
 		return -1;
 	}
 }
+static unsigned int get_max_audio_sample_rate(struct audio_mode *modes)
+{
+	if (modes) {
+		if (modes->sample_rates.rate.RATE_192)
+			return 192000;
+		if (modes->sample_rates.rate.RATE_176_4)
+			return 176400;
+		if (modes->sample_rates.rate.RATE_96)
+			return 96000;
+		if (modes->sample_rates.rate.RATE_88_2)
+			return 88200;
+		if (modes->sample_rates.rate.RATE_48)
+			return 48000;
+		if (modes->sample_rates.rate.RATE_44_1)
+			return 44100;
+		if (modes->sample_rates.rate.RATE_32)
+			return 32000;
+	}
+	/*original logic when no audio info*/
+	return 441000;
+}
+
+void get_audio_check(struct audio_info *aud_modes,
+	struct audio_check *audio_chk)
+{
+	unsigned int i;
+	unsigned int max_sample_rate = 0;
+
+	if (aud_modes) {
+		audio_chk->audio_packet_type = 0x2;/*audio sample packet AP = .25 for layout0, 1 for layout1*/
+
+		audio_chk->max_audiosample_rate = 0;
+		for (i = 0; i < aud_modes->mode_count; i++) {
+			max_sample_rate = get_max_audio_sample_rate(&aud_modes->modes[i]);
+			if (audio_chk->max_audiosample_rate < max_sample_rate)
+				audio_chk->max_audiosample_rate = max_sample_rate;
+			/*dts takes the same as type 2: AP = 0.25*/
+		}
+		/*check which one take more bandwidth*/
+		if (audio_chk->max_audiosample_rate > 192000)
+			audio_chk->audio_packet_type = 0x9;/*AP =1*/
+		audio_chk->acat = 0;/*not support*/
+	}
+}
+

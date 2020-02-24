@@ -1,11 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Broadcom BCM7xxx System Port Ethernet MAC driver
  *
  * Copyright (C) 2014 Broadcom Corporation
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
@@ -612,7 +609,7 @@ static int bcm_sysport_set_coalesce(struct net_device *dev,
 				    struct ethtool_coalesce *ec)
 {
 	struct bcm_sysport_priv *priv = netdev_priv(dev);
-	struct net_dim_cq_moder moder;
+	struct dim_cq_moder moder;
 	u32 usecs, pkts;
 	unsigned int i;
 
@@ -711,8 +708,7 @@ static int bcm_sysport_alloc_rx_bufs(struct bcm_sysport_priv *priv)
 	for (i = 0; i < priv->num_rx_bds; i++) {
 		cb = &priv->rx_cbs[i];
 		skb = bcm_sysport_rx_refill(priv, cb);
-		if (skb)
-			dev_kfree_skb(skb);
+		dev_kfree_skb(skb);
 		if (!cb->skb)
 			return -ENOMEM;
 	}
@@ -995,7 +991,7 @@ static int bcm_sysport_poll(struct napi_struct *napi, int budget)
 {
 	struct bcm_sysport_priv *priv =
 		container_of(napi, struct bcm_sysport_priv, napi);
-	struct net_dim_sample dim_sample;
+	struct dim_sample dim_sample = {};
 	unsigned int work_done = 0;
 
 	work_done = bcm_sysport_desc_rx(priv, budget);
@@ -1019,8 +1015,8 @@ static int bcm_sysport_poll(struct napi_struct *napi, int budget)
 	}
 
 	if (priv->dim.use_dim) {
-		net_dim_sample(priv->dim.event_ctr, priv->dim.packets,
-			       priv->dim.bytes, &dim_sample);
+		dim_update_sample(priv->dim.event_ctr, priv->dim.packets,
+				  priv->dim.bytes, &dim_sample);
 		net_dim(&priv->dim.dim, dim_sample);
 	}
 
@@ -1090,16 +1086,16 @@ static void bcm_sysport_resume_from_wol(struct bcm_sysport_priv *priv)
 
 static void bcm_sysport_dim_work(struct work_struct *work)
 {
-	struct net_dim *dim = container_of(work, struct net_dim, work);
+	struct dim *dim = container_of(work, struct dim, work);
 	struct bcm_sysport_net_dim *ndim =
 			container_of(dim, struct bcm_sysport_net_dim, dim);
 	struct bcm_sysport_priv *priv =
 			container_of(ndim, struct bcm_sysport_priv, dim);
-	struct net_dim_cq_moder cur_profile =
-			net_dim_get_rx_moderation(dim->mode, dim->profile_ix);
+	struct dim_cq_moder cur_profile = net_dim_get_rx_moderation(dim->mode,
+								    dim->profile_ix);
 
 	bcm_sysport_set_rx_coalesce(priv, cur_profile.usec, cur_profile.pkts);
-	dim->state = NET_DIM_START_MEASURE;
+	dim->state = DIM_START_MEASURE;
 }
 
 /* RX and misc interrupt routine */
@@ -1358,7 +1354,7 @@ out:
 	return ret;
 }
 
-static void bcm_sysport_tx_timeout(struct net_device *dev)
+static void bcm_sysport_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
 	netdev_warn(dev, "transmit timeout!\n");
 
@@ -1440,7 +1436,7 @@ static void bcm_sysport_init_dim(struct bcm_sysport_priv *priv,
 	struct bcm_sysport_net_dim *dim = &priv->dim;
 
 	INIT_WORK(&dim->dim.work, cb);
-	dim->dim.mode = NET_DIM_CQ_PERIOD_MODE_START_FROM_EQE;
+	dim->dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
 	dim->event_ctr = 0;
 	dim->packets = 0;
 	dim->bytes = 0;
@@ -1449,7 +1445,7 @@ static void bcm_sysport_init_dim(struct bcm_sysport_priv *priv,
 static void bcm_sysport_init_rx_coalesce(struct bcm_sysport_priv *priv)
 {
 	struct bcm_sysport_net_dim *dim = &priv->dim;
-	struct net_dim_cq_moder moder;
+	struct dim_cq_moder moder;
 	u32 usecs, pkts;
 
 	usecs = priv->rx_coalesce_usecs;
@@ -2327,7 +2323,7 @@ static int bcm_sysport_map_queues(struct notifier_block *nb,
 		ring->switch_queue = qp;
 		ring->switch_port = port;
 		ring->inspect = true;
-		priv->ring_map[q + port * num_tx_queues] = ring;
+		priv->ring_map[qp + port * num_tx_queues] = ring;
 		qp++;
 	}
 
@@ -2342,7 +2338,7 @@ static int bcm_sysport_unmap_queues(struct notifier_block *nb,
 	struct net_device *slave_dev;
 	unsigned int num_tx_queues;
 	struct net_device *dev;
-	unsigned int q, port;
+	unsigned int q, qp, port;
 
 	priv = container_of(nb, struct bcm_sysport_priv, dsa_notifier);
 	if (priv->netdev != info->master)
@@ -2368,7 +2364,8 @@ static int bcm_sysport_unmap_queues(struct notifier_block *nb,
 			continue;
 
 		ring->inspect = false;
-		priv->ring_map[q + port * num_tx_queues] = NULL;
+		qp = ring->switch_queue;
+		priv->ring_map[qp + port * num_tx_queues] = NULL;
 	}
 
 	return 0;
@@ -2423,15 +2420,21 @@ static int bcm_sysport_probe(struct platform_device *pdev)
 	struct device_node *dn;
 	struct net_device *dev;
 	const void *macaddr;
-	struct resource *r;
 	u32 txq, rxq;
 	int ret;
 
 	dn = pdev->dev.of_node;
-	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	of_id = of_match_node(bcm_sysport_of_match, dn);
 	if (!of_id || !of_id->data)
 		return -EINVAL;
+
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(40));
+	if (ret)
+		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	if (ret) {
+		dev_err(&pdev->dev, "unable to set DMA mask: %d\n", ret);
+		return ret;
+	}
 
 	/* Fairly quickly we need to know the type of adapter we have */
 	params = of_id->data;
@@ -2476,7 +2479,7 @@ static int bcm_sysport_probe(struct platform_device *pdev)
 		goto err_free_netdev;
 	}
 
-	priv->base = devm_ioremap_resource(&pdev->dev, r);
+	priv->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(priv->base)) {
 		ret = PTR_ERR(priv->base);
 		goto err_free_netdev;
@@ -2485,9 +2488,9 @@ static int bcm_sysport_probe(struct platform_device *pdev)
 	priv->netdev = dev;
 	priv->pdev = pdev;
 
-	priv->phy_interface = of_get_phy_mode(dn);
+	ret = of_get_phy_mode(dn, &priv->phy_interface);
 	/* Default to GMII interface mode */
-	if (priv->phy_interface < 0)
+	if (ret)
 		priv->phy_interface = PHY_INTERFACE_MODE_GMII;
 
 	/* In the case of a fixed PHY, the DT node associated
@@ -2732,6 +2735,9 @@ static int __maybe_unused bcm_sysport_resume(struct device *d)
 		return 0;
 
 	umac_reset(priv);
+
+	/* Disable the UniMAC RX/TX */
+	umac_enable_set(priv, CMD_RX_EN | CMD_TX_EN, 0);
 
 	/* We may have been suspended and never received a WOL event that
 	 * would turn off MPD detection, take care of that now
